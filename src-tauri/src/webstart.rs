@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 use anyhow::Error;
@@ -308,22 +309,43 @@ impl WebstartFile {
                 msg: format!("failed to list directory entry: {}", e),
             })?;
             let file_path = e.path();
-            jar_files.push(file_path);
+            if file_path.extension().and_then(|e| e.to_str()) == Some("jar") {
+                jar_files.push(file_path);
+            }
         }
 
         jar_files.sort_unstable();
         println!("{:?}", jar_files);
 
-        for jf in jar_files {
+        let mut verified_count = 0usize;
+        let mut skipped_count = 0usize;
+        for jf in &jar_files {
             let file_path = jf.to_str().ok_or_else(|| VerificationError {
                 cert: None,
                 msg: format!("jar file path is not valid UTF-8: {:?}", jf),
             })?;
+            if is_already_verified(jf) {
+                skipped_count += 1;
+                println!("skipping verification of {} (already verified)", file_path);
+                continue;
+            }
             verify_jar(file_path, cert_store, trusted_certs)?;
+            mark_as_verified(jf);
+            verified_count += 1;
         }
+        println!("verification complete: {} verified, {} skipped (unchanged)", verified_count, skipped_count);
         Ok(())
     }
 }
+
+struct JarTask {
+    url: String,
+    file_path: PathBuf,
+    file_name: String,
+    hash: Option<String>,
+}
+
+const DOWNLOAD_THREADS: usize = 4;
 
 fn download_jars(
     resources_node: &Node,
@@ -332,7 +354,87 @@ fn download_jars(
     base_url: &str,
     on_progress: &Channel<serde_json::Value>,
 ) -> Result<(), Error> {
-    let mut counter = 0usize;
+    // Phase 1: collect all JAR tasks, resolving extensions sequentially
+    let mut tasks = Vec::new();
+    collect_jar_tasks(resources_node, client, dir_path, base_url, &mut tasks, on_progress)?;
+
+    // Phase 2: check cache and build download list
+    let mut to_download = Vec::new();
+    for task in &tasks {
+        let _ = on_progress.send(serde_json::json!({
+            "message": format!("Verifying cache file {}", task.file_name),
+        }));
+        if has_file_changed(&task.file_path, task.hash.as_deref())? {
+            to_download.push(task);
+        }
+    }
+
+    if to_download.is_empty() {
+        return Ok(());
+    }
+
+    let total = to_download.len();
+    let _ = on_progress.send(serde_json::json!({
+        "message": format!("Downloading {} JARs...", total),
+    }));
+
+    // Phase 3: download in parallel
+    let completed = AtomicUsize::new(0);
+    let first_error: Mutex<Option<Error>> = Mutex::new(None);
+
+    std::thread::scope(|s| {
+        let num_threads = to_download.len().min(DOWNLOAD_THREADS);
+        let chunk_size = (to_download.len() + num_threads - 1) / num_threads;
+        for chunk in to_download.chunks(chunk_size) {
+            let client = client;
+            let completed = &completed;
+            let first_error = &first_error;
+            let on_progress = on_progress;
+            s.spawn(move || {
+                for task in chunk {
+                    // Stop if another thread hit an error
+                    if first_error.lock().expect("error lock poisoned").is_some() {
+                        return;
+                    }
+                    let result = (|| -> Result<(), Error> {
+                        let mut resp = client.get(&task.url).send()?;
+                        let mut f = File::create(&task.file_path)?;
+                        resp.copy_to(&mut f)?;
+                        let _ = std::fs::remove_file(task.file_path.with_extension("jar.verified"));
+                        let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                        let _ = on_progress.send(serde_json::json!({
+                            "message": format!("Downloaded {} ({}/{})", task.file_name, done, total),
+                        }));
+                        Ok(())
+                    })();
+                    if let Err(e) = result {
+                        let mut err = first_error.lock().expect("error lock poisoned");
+                        if err.is_none() {
+                            *err = Some(e);
+                        }
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    let err = first_error.into_inner().expect("error lock poisoned");
+    if let Some(e) = err {
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+fn collect_jar_tasks(
+    resources_node: &Node,
+    client: &Client,
+    dir_path: &Path,
+    base_url: &str,
+    tasks: &mut Vec<JarTask>,
+    on_progress: &Channel<serde_json::Value>,
+) -> Result<(), Error> {
     for n in resources_node.children() {
         let jar = n.has_tag_name("jar");
         let extension = n.has_tag_name("extension");
@@ -345,37 +447,39 @@ fn download_jars(
             Some(h) => h,
             None => continue,
         };
-        let hash_in_jnlp = n.attribute("sha256");
         let url = format!("{}/{}", base_url, href);
 
         if jar {
-            let file_name = get_file_name_from_path(href);
-            counter += 1;
-            let jar_file_path = dir_path.join(file_name);
-            let _ = on_progress.send(serde_json::json!({
-                "message": format!("Verifying cache file {}", file_name),
-            }));
-            if has_file_changed(&jar_file_path, hash_in_jnlp)? {
-                let _ = on_progress.send(serde_json::json!({
-                    "message": format!("Downloading {} ({})", file_name, counter),
-                }));
-                let mut resp = client.get(url).send()?;
-                let mut f = File::create(&jar_file_path)?;
-                resp.copy_to(&mut f)?;
-            }
+            let file_name = get_file_name_from_path(href).to_string();
+            let file_path = dir_path.join(&file_name);
+            let hash = n.attribute("sha256").map(|s| s.to_string());
+            tasks.push(JarTask { url, file_path, file_name, hash });
         } else if extension {
-            let r = client.get(url).send()?;
-            let data = r.text()?;
+            let ext_name = get_file_name_from_path(href);
+            let ext_cache_path = dir_path.join(ext_name);
+            let data = if ext_cache_path.exists() {
+                let _ = on_progress.send(serde_json::json!({
+                    "message": format!("Loading cached extension {}...", ext_name),
+                }));
+                std::fs::read_to_string(&ext_cache_path)?
+            } else {
+                let _ = on_progress.send(serde_json::json!({
+                    "message": format!("Fetching extension {}...", ext_name),
+                }));
+                let r = client.get(url).send()?;
+                let body = r.text()?;
+                let _ = std::fs::write(&ext_cache_path, &body);
+                body
+            };
             let doc = roxmltree::Document::parse(&data)?;
             let root = doc.root();
             let resources_node = get_node(&root, "resources");
             let ext_base_url = format!("{}/webstart/extensions", base_url);
             if let Some(resources_node) = resources_node {
-                download_jars(&resources_node, client, dir_path, &ext_base_url, on_progress)?;
+                collect_jar_tasks(&resources_node, client, dir_path, &ext_base_url, tasks, on_progress)?;
             }
         }
     }
-
     Ok(())
 }
 
@@ -478,25 +582,44 @@ fn normalize_url(u: &str) -> Result<(String, String), Error> {
     Ok((reconstructed_url, host))
 }
 
-fn has_file_changed(jar_file_path: &Path, hash_in_jnlp: Option<&str>) -> Result<bool, Error> {
-    if let Some(hash_in_jnlp) = hash_in_jnlp {
-        let mut hasher = Sha256::new();
-        if jar_file_path.exists() {
-            let jar_file = File::open(&jar_file_path)?;
-            let mut reader = BufReader::new(&jar_file);
-            let mut buf = [0; 2048];
-            while let Ok(count) = reader.read(&mut buf) {
-                if count <= 0 {
-                    break;
-                }
-                hasher.update(&buf[..count]);
-            }
-            let val = hasher.finalize();
-            let val = openssl::base64::encode_block(val.as_slice());
-            return Ok(hash_in_jnlp != &val);
+fn sha256_of_file(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return None,
         }
     }
+    Some(openssl::base64::encode_block(hasher.finalize().as_slice()))
+}
 
+fn is_already_verified(jar_path: &Path) -> bool {
+    let sidecar = jar_path.with_extension("jar.verified");
+    if let Some(stored_hash) = std::fs::read_to_string(&sidecar).ok() {
+        if let Some(current_hash) = sha256_of_file(jar_path) {
+            return stored_hash.trim() == current_hash;
+        }
+    }
+    false
+}
+
+fn mark_as_verified(jar_path: &Path) {
+    if let Some(hash) = sha256_of_file(jar_path) {
+        let sidecar = jar_path.with_extension("jar.verified");
+        let _ = std::fs::write(&sidecar, hash);
+    }
+}
+
+fn has_file_changed(jar_file_path: &Path, hash_in_jnlp: Option<&str>) -> Result<bool, Error> {
+    if let Some(hash_in_jnlp) = hash_in_jnlp {
+        if let Some(current_hash) = sha256_of_file(jar_file_path) {
+            return Ok(hash_in_jnlp != &current_hash);
+        }
+    }
     Ok(true)
 }
 #[cfg(test)]
