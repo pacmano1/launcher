@@ -26,6 +26,16 @@ use crate::connection::ConnectionEntry;
 use crate::errors::VerificationError;
 use crate::verify::verify_jar;
 
+/// How long a cached WebstartFile remains valid before re-fetching (seconds)
+const WEBSTART_CACHE_TTL_SECS: u64 = 120;
+
+/// Maximum concurrent download threads for JAR retrieval
+const DOWNLOAD_THREADS: usize = 4;
+
+/// Windows: CREATE_NO_WINDOW flag to suppress console window
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct WebstartFile {
@@ -44,14 +54,14 @@ pub struct J2se {
     version: String,
 }
 
-pub struct WebStartCache {
+pub struct WebstartCache {
     cache: Mutex<FxHashMap<String, Arc<WebstartFile>>>,
 }
 
-impl WebStartCache {
+impl WebstartCache {
     pub fn init() -> Self {
         let cache = Mutex::new(FxHashMap::default());
-        WebStartCache { cache }
+        WebstartCache { cache }
     }
 
     pub fn get(&self, url: &str) -> Option<Arc<WebstartFile>> {
@@ -62,11 +72,16 @@ impl WebStartCache {
             let elapsed = now
                 .duration_since(wf.loaded_at)
                 .expect("failed to calculate the duration");
-            if elapsed.as_secs() < 120 {
+            if elapsed.as_secs() < WEBSTART_CACHE_TTL_SECS {
                 return Some(Arc::clone(wf));
             }
         }
         None
+    }
+
+    pub fn put(&self, url: &str, wf: Arc<WebstartFile>) {
+        let mut cache = self.cache.lock().expect("webstart cache lock poisoned");
+        cache.insert(url.to_string(), wf);
     }
 }
 
@@ -147,8 +162,8 @@ impl WebstartFile {
 
     pub fn run(&self, ce: Arc<ConnectionEntry>, console_jar: Option<PathBuf>) -> Result<(), Error> {
         let itr = self.jar_dir.read_dir()?;
-        let mut classpath = String::with_capacity(1152);
-        let mut classpath_suffix = String::with_capacity(1024);
+        let mut mirth_jars = Vec::new();
+        let mut other_jars = Vec::new();
         for e in itr {
             let e = e?;
             if e.metadata()?.is_dir() {
@@ -160,27 +175,25 @@ impl WebstartFile {
                 None => continue,
             };
             let file_path_str = match file_path.to_str() {
-                Some(p) => p,
+                Some(p) => p.to_string(),
                 None => continue,
             };
-
-            //In Windows the CP separator is ';' and literally every other OS is ':'
-            let classpath_separator = if cfg!(windows) { ';' } else { ':' };
 
             // MirthConnect's own jars contain some overridden classes
             // of the dependent libraries and hence must be loaded first
             // https://forums.mirthproject.io/forum/mirth-connect/support/15524-using-com-mirth-connect-client-core-client
-            //TODO this should probably build the classpath objects as an ordered set, then do a .join(classpath_separator)
             if file_name.starts_with("mirth") {
-                classpath.push_str(file_path_str);
-                classpath.push(classpath_separator);
+                mirth_jars.push(file_path_str);
             } else {
-                classpath_suffix.push_str(file_path_str);
-                classpath_suffix.push(classpath_separator);
+                other_jars.push(file_path_str);
             }
         }
 
-        classpath.push_str(&classpath_suffix);
+        mirth_jars.sort();
+        other_jars.sort();
+        let classpath_separator = if cfg!(windows) { ";" } else { ":" };
+        mirth_jars.extend(other_jars);
+        let classpath = mirth_jars.join(classpath_separator);
 
         let mut cmd;
         let java_home = ce.java_home.trim();
@@ -215,8 +228,10 @@ impl WebstartFile {
         }
 
         if let Some(args) = ce.java_args.as_deref() {
-            // Should probably do some sanitization here...
-            cmd.args(args.trim().lines());
+            let sanitized = sanitize_vm_args(args);
+            if !sanitized.is_empty() {
+                cmd.args(sanitized.split_whitespace());
+            }
         }
 
         cmd.arg("-cp")
@@ -250,14 +265,14 @@ impl WebstartFile {
                 .arg("com.innovarhealthcare.launcher.JavaConsoleDialog")
                 .stdin(Stdio::piped());
             #[cfg(windows)]
-            console_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            console_cmd.creation_flags(CREATE_NO_WINDOW);
             let mut console_proc = console_cmd.spawn()?;
 
             // Launch the target process with stdout piped to the console
             // stderr inherits (default) so it doesn't block the process
             cmd.stdout(Stdio::piped());
             #[cfg(windows)]
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            cmd.creation_flags(CREATE_NO_WINDOW);
             let mut target_proc = cmd.spawn()?;
 
             // Pipe target stdout → console stdin in a background thread
@@ -287,7 +302,7 @@ impl WebstartFile {
             cmd.stdout(Stdio::inherit());
             cmd.stderr(Stdio::inherit());
             #[cfg(windows)]
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            cmd.creation_flags(CREATE_NO_WINDOW);
             cmd.spawn()?;
         }
 
@@ -324,13 +339,22 @@ impl WebstartFile {
                 cert: None,
                 msg: format!("jar file path is not valid UTF-8: {:?}", jf),
             })?;
-            if is_already_verified(jf) {
-                skipped_count += 1;
-                println!("skipping verification of {} (already verified)", file_path);
-                continue;
+            let hash = sha256_of_file(jf);
+            if let Some(ref hash) = hash {
+                let sidecar = jf.with_extension("jar.verified");
+                if let Ok(stored) = std::fs::read_to_string(&sidecar) {
+                    if stored.trim() == hash {
+                        skipped_count += 1;
+                        println!("skipping verification of {} (already verified)", file_path);
+                        continue;
+                    }
+                }
             }
             verify_jar(file_path, cert_store, trusted_certs)?;
-            mark_as_verified(jf);
+            if let Some(hash) = hash {
+                let sidecar = jf.with_extension("jar.verified");
+                let _ = std::fs::write(&sidecar, hash);
+            }
             verified_count += 1;
         }
         println!("verification complete: {} verified, {} skipped (unchanged)", verified_count, skipped_count);
@@ -344,8 +368,6 @@ struct JarTask {
     file_name: String,
     hash: Option<String>,
 }
-
-const DOWNLOAD_THREADS: usize = 4;
 
 fn download_jars(
     resources_node: &Node,
@@ -597,22 +619,6 @@ fn sha256_of_file(path: &Path) -> Option<String> {
     Some(openssl::base64::encode_block(hasher.finalize().as_slice()))
 }
 
-fn is_already_verified(jar_path: &Path) -> bool {
-    let sidecar = jar_path.with_extension("jar.verified");
-    if let Some(stored_hash) = std::fs::read_to_string(&sidecar).ok() {
-        if let Some(current_hash) = sha256_of_file(jar_path) {
-            return stored_hash.trim() == current_hash;
-        }
-    }
-    false
-}
-
-fn mark_as_verified(jar_path: &Path) {
-    if let Some(hash) = sha256_of_file(jar_path) {
-        let sidecar = jar_path.with_extension("jar.verified");
-        let _ = std::fs::write(&sidecar, hash);
-    }
-}
 
 fn has_file_changed(jar_file_path: &Path, hash_in_jnlp: Option<&str>) -> Result<bool, Error> {
     if let Some(hash_in_jnlp) = hash_in_jnlp {

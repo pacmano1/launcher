@@ -15,7 +15,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 
 use crate::connection::{ConnectionEntry, ConnectionStore};
-use crate::webstart::{WebStartCache, WebstartFile};
+use crate::webstart::{WebstartCache, WebstartFile};
 
 mod connection;
 mod errors;
@@ -35,7 +35,7 @@ async fn get_launcher_info() -> String {
 }
 
 #[tauri::command(rename_all = "snake_case")]
-async fn launch(id: String, on_progress: Channel<serde_json::Value>, app: AppHandle, cs: State<'_, ConnectionStore>, wc: State<'_, WebStartCache>) -> Result<String, String> {
+async fn launch(id: String, on_progress: Channel<serde_json::Value>, app: AppHandle, cs: State<'_, ConnectionStore>, wc: State<'_, WebstartCache>) -> Result<String, String> {
     let ce = cs.get(&id)
         .ok_or_else(|| format!("connection not found: {}", id))?;
     let cache_dir = cs.cache_dir.clone();
@@ -62,7 +62,9 @@ async fn launch(id: String, on_progress: Channel<serde_json::Value>, app: AppHan
                 return Ok(create_json_resp(-1, &msg));
             }
             Ok(wf) => {
-                ws = Some(Arc::new(wf));
+                let wf = Arc::new(wf);
+                wc.put(&address, Arc::clone(&wf));
+                ws = Some(wf);
             }
         }
     }
@@ -180,7 +182,7 @@ fn main() {
         exit(1);
     }
 
-    let webcache = WebStartCache::init();
+    let webcache = WebstartCache::init();
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())

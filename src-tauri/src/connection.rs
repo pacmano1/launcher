@@ -419,7 +419,6 @@ fn create_cert_store(certs: FxHashMap<String, X509>) -> X509Store {
 }
 
 fn get_verify() -> bool {
-    //println!("getting default value for verify attribute");
     true
 }
 

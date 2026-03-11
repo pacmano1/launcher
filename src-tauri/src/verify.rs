@@ -186,8 +186,7 @@ pub fn verify_jar(file_path: &str, cert_store: &X509StoreRef, trusted_certs: &[X
     }
     if signatures.is_empty() {
         for name in za.file_names() {
-            //println!("{}", name);
-            if name.starts_with(META_INF_PREFIX_PATH) && name.ends_with(DOT_SF_SUFFIX) {
+                    if name.starts_with(META_INF_PREFIX_PATH) && name.ends_with(DOT_SF_SUFFIX) {
                 let sf_block_prefix = name
                     .replace(META_INF_PREFIX_PATH, "")
                     .replace(DOT_SF_SUFFIX, "");
@@ -196,7 +195,6 @@ pub fn verify_jar(file_path: &str, cert_store: &X509StoreRef, trusted_certs: &[X
         }
     }
 
-    //println!("{:?}", signatures);
     let manifest_buf;
     {
         let mut manifest_entry_file = za.by_name("META-INF/MANIFEST.MF")?;
@@ -204,7 +202,6 @@ pub fn verify_jar(file_path: &str, cert_store: &X509StoreRef, trusted_certs: &[X
     }
 
     let manifest = Manifest::parse("MANIFEST.MF", manifest_buf.as_slice())?;
-    //println!("{:?}", manifest);
 
     if signatures.is_empty() {
         return Err(VerificationError {
@@ -261,7 +258,9 @@ pub fn verify_jar(file_path: &str, cert_store: &X509StoreRef, trusted_certs: &[X
             if let Err(e) = r {
                 let msg = e.to_string();
                 println!("verification error: {}", msg);
-                if !msg.contains("certificate purpose") { // could be <[unsupported|unsuitable] certificate purpose>
+                // OpenSSL doesn't expose structured error codes for CMS verification failures,
+                // so we match on known error message substrings. Fragile but unavoidable.
+                if !msg.contains("certificate purpose") {
                     if msg.contains("cms_signerinfo_verify_cert") {
                         if !is_trusted {
                             return Err(VerificationError { cert, msg });
@@ -370,7 +369,6 @@ fn get_digest_ref(name: &str) -> Option<&MdRef> {
 fn extract_cert(sigblock: &[u8]) -> Result<Option<X509>, anyhow::Error> {
     let (_, ci) = ContentInfo::from_der(sigblock)
         .map_err(|e| anyhow::anyhow!("failed to parse DER content info: {}", e))?;
-    //println!("{:?}", ci);
     if let Some(cert_set) = ci.signed_data.certificates {
         let cert = X509::from_der(cert_set.content.as_ref())?;
         return Ok(Some(cert));
@@ -386,10 +384,7 @@ fn read_file(zf: &mut ZipFile) -> Result<Vec<u8>, anyhow::Error> {
 
 #[cfg(test)]
 mod tests {
-    use openssl::ssl::SslFiletype;
-    use openssl::x509::store::{HashDir, X509Lookup, X509StoreBuilder};
-    use std::collections::VecDeque;
-    // use asn1::{ParseResult, SimpleAsn1Writable, WriteBuf, Writer};
+    use openssl::x509::store::X509StoreBuilder;
     use super::*;
 
     #[test]
@@ -493,7 +488,7 @@ mod tests {
     pub fn test_parse_content_info() {
         let mut f = File::open("test-resources/RSA.RSA").unwrap();
         let mut buf = Vec::with_capacity(512);
-        let r = f.read_to_end(&mut buf).unwrap();
+        let _ = f.read_to_end(&mut buf).unwrap();
         let (_, ci) = ContentInfo::from_der(buf.as_slice()).unwrap();
         println!("{:?}", ci);
         let cert = X509::from_der(ci.signed_data.certificates.unwrap().content.as_ref());
@@ -503,7 +498,7 @@ mod tests {
     #[test]
     pub fn test_verify() {
         let jar_file = "test-resources/valid-signed.jar";
-        let mut xb = X509StoreBuilder::new().unwrap();
+        let xb = X509StoreBuilder::new().unwrap();
         let store = xb.build();
         let r = verify_jar(jar_file, store.as_ref(), &[]);
         println!("{:?}", r);
@@ -526,7 +521,7 @@ mod tests {
             "test-resources/tampered-app-class.jar",
             "test-resources/tampered-sf.jar",
         ];
-        let mut xb = X509StoreBuilder::new().unwrap();
+        let xb = X509StoreBuilder::new().unwrap();
         let store = xb.build();
         for f in files {
             let r = verify_jar(f, store.as_ref(), &[]);
