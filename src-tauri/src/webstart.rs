@@ -303,10 +303,22 @@ impl WebstartFile {
                 });
             }
         } else {
-            cmd.stdout(Stdio::inherit());
-            cmd.stderr(Stdio::inherit());
+            let log_path = self.jar_dir.join("launch.log");
+            let log_file = File::create(&log_path);
+            match log_file {
+                Ok(log_file) => {
+                    let stderr_log = log_file.try_clone().unwrap_or_else(|_| File::create(&log_path).expect("failed to create log file"));
+                    cmd.stdout(Stdio::from(log_file));
+                    cmd.stderr(Stdio::from(stderr_log));
+                }
+                Err(_) => {
+                    cmd.stdout(Stdio::inherit());
+                    cmd.stderr(Stdio::inherit());
+                }
+            }
             #[cfg(windows)]
             cmd.creation_flags(CREATE_NO_WINDOW);
+            println!("launching: {:?}", cmd);
             cmd.spawn()?;
         }
 
