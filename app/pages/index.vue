@@ -427,7 +427,7 @@ const deselectAll = () => {
             </button>
           </div>
           <div class="space-y-3 text-sm">
-            <p class="text-text-secondary">Version 2.0.2</p>
+            <p class="text-text-secondary">Version 2.0.3</p>
             <div class="space-y-1">
               <p class="text-text-secondary">Originally created by <span class="text-text-primary">Kiran Ayyagari</span></p>
               <p class="text-text-secondary">Modifications by <span class="text-text-primary">Diridium Technologies Inc.</span></p>

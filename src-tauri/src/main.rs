@@ -154,18 +154,6 @@ fn main() {
     }
 
     let home_directory = home::home_dir().expect("unable to find the path to home directory");
-    // <= 0.2.0 migrate from loose files to .ballista directory
-    let legacy_ballista_dir = home_directory.join(".ballista");
-    let r = fs::create_dir(&legacy_ballista_dir);
-    if let Ok(_) = r {
-        move_file(home_directory.join("catapult-data.json"), legacy_ballista_dir.join("ballista-data.json"));
-        move_file(
-            home_directory.join("catapult-trusted-certs.json"),
-            legacy_ballista_dir.join("ballista-trusted-certs.json"),
-        );
-    }
-
-    // >= 2.1.0 migrate from .ballista to .launcher
     let launcher_directory = home_directory.join(".launcher");
     if let Err(e) = fs::create_dir(&launcher_directory) {
         if e.kind() != std::io::ErrorKind::AlreadyExists {
@@ -173,8 +161,17 @@ fn main() {
             exit(1);
         }
     }
-    move_file(legacy_ballista_dir.join("ballista-data.json"), launcher_directory.join("launcher-data.json"));
-    move_file(legacy_ballista_dir.join("ballista-trusted-certs.json"), launcher_directory.join("launcher-trusted-certs.json"));
+
+    // Migrate from legacy directories if they exist
+    let legacy_ballista_dir = home_directory.join(".ballista");
+    if legacy_ballista_dir.exists() {
+        move_file(legacy_ballista_dir.join("ballista-data.json"), launcher_directory.join("launcher-data.json"));
+        move_file(legacy_ballista_dir.join("ballista-trusted-certs.json"), launcher_directory.join("launcher-trusted-certs.json"));
+    } else {
+        // Pre-ballista: loose files in home dir with catapult naming
+        move_file(home_directory.join("catapult-data.json"), launcher_directory.join("launcher-data.json"));
+        move_file(home_directory.join("catapult-trusted-certs.json"), launcher_directory.join("launcher-trusted-certs.json"));
+    }
 
     let connection_store = ConnectionStore::init(launcher_directory);
     if let Err(e) = connection_store {

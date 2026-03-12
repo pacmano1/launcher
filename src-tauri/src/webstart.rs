@@ -170,6 +170,9 @@ impl WebstartFile {
                 continue;
             }
             let file_path = e.path();
+            if file_path.extension().and_then(|e| e.to_str()) != Some("jar") {
+                continue;
+            }
             let file_name = match file_path.file_name().and_then(|f| f.to_str()) {
                 Some(name) => name.to_string(),
                 None => continue,
@@ -200,7 +203,8 @@ impl WebstartFile {
         if java_home.is_empty() {
             cmd = Command::new("java")
         } else {
-            cmd = Command::new(format!("{}/bin/java", java_home));
+            let java_bin = PathBuf::from(java_home).join("bin").join("java");
+            cmd = Command::new(java_bin);
         }
 
         println!("using java from: {:?}", cmd.get_program().to_str());
@@ -252,9 +256,9 @@ impl WebstartFile {
 
             // Launch the Java Console as a separate Java Swing process
             let java_bin = if java_home.is_empty() {
-                "java".to_string()
+                PathBuf::from("java")
             } else {
-                format!("{}/bin/java", java_home)
+                PathBuf::from(java_home).join("bin").join("java")
             };
 
             let mut console_cmd = Command::new(&java_bin);
