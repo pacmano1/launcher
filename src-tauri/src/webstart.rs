@@ -44,7 +44,15 @@ pub struct WebstartFile {
     args: Vec<String>,
     j2ses: Option<Vec<J2se>>,
     jar_dir: PathBuf,
+    logs_dir: PathBuf,
+    conn_id: String,
     loaded_at: SystemTime,
+}
+
+#[derive(Debug)]
+struct VendorInfo {
+    vendor: String,
+    version: String,
 }
 
 /// from jnlp -> resources -> j2se
@@ -86,7 +94,7 @@ impl WebstartCache {
 }
 
 impl WebstartFile {
-    pub fn load(base_url: &str, cache_dir: &PathBuf, donotcache: bool, conn_id: &str, conn_name: &str, on_progress: &Channel<serde_json::Value>) -> Result<WebstartFile, Error> {
+    pub fn load(base_url: &str, cache_dir: &PathBuf, donotcache: bool, conn_id: &str, conn_name: &str, logs_dir: &PathBuf, on_progress: &Channel<serde_json::Value>) -> Result<WebstartFile, Error> {
         let (base_url, _host) = normalize_url(base_url)?;
         let webstart = format!("{}/webstart.jnlp", base_url); // base_url will never contain a / at the end after normalization
         let _ = on_progress.send(serde_json::json!({"message": "Fetching server configuration..."}));
@@ -114,37 +122,63 @@ impl WebstartFile {
 
         let resources_node = get_node(&root, "resources");
 
-        let mut version = "default".to_string();
+        let mut jnlp_version = "default".to_string();
         if let Some(jnlp_node) = get_node(&root, "jnlp") {
             if let Some(v) = jnlp_node.attribute("version") {
                 // Sanitize to prevent path traversal (e.g. "../../.ssh")
-                version = v.replace(['/', '\\', '.'], "_");
+                jnlp_version = v.replace(['/', '\\', '.'], "_");
             }
         }
 
-        let sanitized_name = conn_name
-            .to_lowercase()
-            .chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '-' })
-            .collect::<String>();
-        let id_prefix = &conn_id[..conn_id.len().min(8)];
-        let cache_folder = format!("{}_{}", sanitized_name, id_prefix);
-        let jar_dir = cache_dir.join(cache_folder).join(&version);
-        if donotcache && jar_dir.exists() {
-            println!("removing directory {:?}", jar_dir);
-            std::fs::remove_dir_all(&jar_dir)?;
-        }
+        // Build jar_dir based on donotcache flag and vendor detection
+        let jar_dir = if donotcache {
+            // Isolated directory — wiped each launch, never touches shared cache
+            let dir = cache_dir.join("_isolated").join(conn_id);
+            if dir.exists() {
+                println!("removing isolated cache directory {:?}", dir);
+                std::fs::remove_dir_all(&dir)?;
+            }
+            dir
+        } else {
+            // Try to detect vendor and version from /api endpoint
+            let _ = on_progress.send(serde_json::json!({"message": "Detecting server version..."}));
+            match fetch_vendor_info(&client, &base_url) {
+                Some(info) => {
+                    println!("detected vendor: {} version: {}", info.vendor, info.version);
+                    cache_dir.join(&info.vendor).join(&info.version)
+                }
+                None => {
+                    println!("could not detect vendor info, using fallback cache path");
+                    cache_dir.join("_unknown").join(&jnlp_version)
+                }
+            }
+        };
 
-        let dir_path = jar_dir.as_path();
         if !jar_dir.exists() {
             println!("creating directory {:?}", jar_dir);
-            std::fs::create_dir_all(dir_path)?;
+            std::fs::create_dir_all(&jar_dir)?;
         }
 
         let mut j2ses = None;
         if let Some(resources_node) = resources_node {
             j2ses = get_j2ses(&resources_node);
-            download_jars(&resources_node, &client, dir_path, &base_url, on_progress)?;
+            download_jars(&resources_node, &client, jar_dir.as_path(), &base_url, on_progress)?;
+        }
+
+        // Migration: clean up old per-connection cache directory
+        if !donotcache {
+            let sanitized_name = conn_name
+                .to_lowercase()
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '-' })
+                .collect::<String>();
+            let id_prefix = &conn_id[..conn_id.len().min(8)];
+            let old_cache_folder = format!("{}_{}", sanitized_name, id_prefix);
+            let old_jar_dir = cache_dir.join(old_cache_folder);
+            if old_jar_dir.exists() {
+                println!("migrating: removing old cache directory {:?}", old_jar_dir);
+                let _ = std::fs::remove_dir_all(&old_jar_dir);
+            }
         }
 
         let loaded_at = SystemTime::now();
@@ -152,6 +186,8 @@ impl WebstartFile {
             url: base_url.to_string(),
             main_class,
             jar_dir,
+            logs_dir: logs_dir.clone(),
+            conn_id: conn_id.to_string(),
             args,
             loaded_at,
             j2ses,
@@ -303,7 +339,7 @@ impl WebstartFile {
                 });
             }
         } else {
-            let log_path = self.jar_dir.join("launch.log");
+            let log_path = self.logs_dir.join(format!("{}.log", self.conn_id));
             let log_file = File::create(&log_path);
             match log_file {
                 Ok(log_file) => {
@@ -380,6 +416,61 @@ impl WebstartFile {
         println!("verification complete: {} verified, {} skipped (unchanged)", verified_count, skipped_count);
         Ok(())
     }
+}
+
+/// Fetch vendor name and version from the server's OpenAPI spec at /api.
+/// Returns None if the endpoint is unreachable or returns unexpected format.
+fn fetch_vendor_info(client: &Client, base_url: &str) -> Option<VendorInfo> {
+    let api_url = format!("{}/api", base_url);
+    let resp = client
+        .get(&api_url)
+        .header("Accept", "application/json")
+        .header("X-Requested-With", "XMLHttpRequest")
+        .send()
+        .ok()?;
+
+    if !resp.status().is_success() {
+        println!("vendor info: /api returned status {}", resp.status());
+        return None;
+    }
+
+    let text = resp.text().ok()?;
+    let body: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let info = body.get("info")?;
+    let title = info.get("title")?.as_str()?;
+    let version = info.get("version")?.as_str()?;
+
+    let vendor = sanitize_for_path(title);
+    let version = sanitize_for_path(version);
+
+    if vendor.is_empty() || version.is_empty() {
+        println!("vendor info: empty vendor or version after sanitization");
+        return None;
+    }
+
+    Some(VendorInfo { vendor, version })
+}
+
+/// Sanitize a string for use as a filesystem path component.
+/// Lowercase, replace dots with underscores, other non-alphanumeric with hyphens,
+/// then trim leading/trailing separators.
+fn sanitize_for_path(s: &str) -> String {
+    let sanitized: String = s
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c
+            } else if c == '.' {
+                '_'
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    sanitized
+        .trim_matches(|c: char| c == '-' || c == '_')
+        .to_string()
 }
 
 struct JarTask {

@@ -52,6 +52,7 @@ pub struct ConnectionStore {
     con_cache: Mutex<HashMap<String, Arc<ConnectionEntry>>>,
     con_location: PathBuf,
     pub cache_dir: PathBuf,
+    pub logs_dir: PathBuf,
     cert_store: Mutex<Arc<X509Store>>,
     trusted_certs_location: PathBuf,
 }
@@ -111,12 +112,18 @@ impl ConnectionStore {
             fs::create_dir(&cache_dir)?;
         }
 
+        let logs_dir = data_dir_path.join("logs");
+        if !logs_dir.exists() {
+            fs::create_dir(&logs_dir)?;
+        }
+
         Ok(ConnectionStore {
             con_location,
             con_cache: Mutex::new(cache),
             cert_store: Mutex::new(Arc::new(cert_store)),
             trusted_certs_location,
-            cache_dir
+            cache_dir,
+            logs_dir,
         })
     }
 
