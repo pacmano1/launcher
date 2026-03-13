@@ -355,22 +355,26 @@ impl WebstartFile {
                 cert: None,
                 msg: format!("jar file path is not valid UTF-8: {:?}", jf),
             })?;
-            let hash = sha256_of_file(jf);
-            if let Some(ref hash) = hash {
-                let sidecar = jf.with_extension("jar.verified");
-                if let Ok(stored) = std::fs::read_to_string(&sidecar) {
-                    if stored.trim() == hash {
-                        skipped_count += 1;
-                        println!("skipping verification of {} (already verified)", file_path);
-                        continue;
-                    }
+            // Read the JAR into memory once — used for both hashing and verification
+            let jar_data = std::fs::read(jf).map_err(|e| VerificationError {
+                cert: None,
+                msg: format!("failed to read jar file {:?}: {}", jf, e),
+            })?;
+            let mut hasher = Sha256::new();
+            hasher.update(&jar_data);
+            let hash = openssl::base64::encode_block(hasher.finalize().as_slice());
+
+            let sidecar = jf.with_extension("jar.verified");
+            if let Ok(stored) = std::fs::read_to_string(&sidecar) {
+                if stored.trim() == hash {
+                    skipped_count += 1;
+                    println!("skipping verification of {} (already verified)", file_path);
+                    continue;
                 }
             }
-            verify_jar(file_path, cert_store, trusted_certs)?;
-            if let Some(hash) = hash {
-                let sidecar = jf.with_extension("jar.verified");
-                let _ = std::fs::write(&sidecar, hash);
-            }
+
+            verify_jar(file_path, &jar_data, cert_store, trusted_certs)?;
+            let _ = std::fs::write(&sidecar, &hash);
             verified_count += 1;
         }
         println!("verification complete: {} verified, {} skipped (unchanged)", verified_count, skipped_count);

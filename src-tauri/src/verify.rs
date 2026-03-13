@@ -2,7 +2,6 @@
 // Copyright (c) Diridium Technologies Inc. All rights reserved.
 // Licensed under the MPL-2.0 License. See LICENSE file in the project root.
 
-use std::fs::File;
 use std::io::{read_to_string, Read};
 use std::iter::Peekable;
 
@@ -169,9 +168,9 @@ impl Manifest {
     }
 }
 
-pub fn verify_jar(file_path: &str, cert_store: &X509StoreRef, trusted_certs: &[X509]) -> Result<(), VerificationError> {
-    let f = File::open(file_path)?;
-    let mut za = zip::ZipArchive::new(f)?;
+pub fn verify_jar(file_path: &str, jar_data: &[u8], cert_store: &X509StoreRef, trusted_certs: &[X509]) -> Result<(), VerificationError> {
+    let cursor = std::io::Cursor::new(jar_data);
+    let mut za = zip::ZipArchive::new(cursor)?;
 
     let mut signatures = Vec::new();
     const META_INF_PREFIX_PATH: &'static str = "META-INF/";
@@ -384,6 +383,7 @@ fn read_file(zf: &mut ZipFile) -> Result<Vec<u8>, anyhow::Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
     use openssl::x509::store::X509StoreBuilder;
     use super::*;
 
@@ -498,9 +498,10 @@ mod tests {
     #[test]
     pub fn test_verify() {
         let jar_file = "test-resources/valid-signed.jar";
+        let jar_data = std::fs::read(jar_file).unwrap();
         let xb = X509StoreBuilder::new().unwrap();
         let store = xb.build();
-        let r = verify_jar(jar_file, store.as_ref(), &[]);
+        let r = verify_jar(jar_file, &jar_data, store.as_ref(), &[]);
         println!("{:?}", r);
         assert!(r.is_err());
         let ve = r.err().unwrap();
@@ -510,7 +511,7 @@ mod tests {
         let mut xb = X509StoreBuilder::new().unwrap();
         xb.add_cert(cert).unwrap();
         let store = xb.build();
-        let r = verify_jar(jar_file, store.as_ref(), &trusted);
+        let r = verify_jar(jar_file, &jar_data, store.as_ref(), &trusted);
         println!("{:?}", r);
         assert!(r.is_ok());
     }
@@ -524,7 +525,8 @@ mod tests {
         let xb = X509StoreBuilder::new().unwrap();
         let store = xb.build();
         for f in files {
-            let r = verify_jar(f, store.as_ref(), &[]);
+            let jar_data = std::fs::read(f).unwrap();
+            let r = verify_jar(f, &jar_data, store.as_ref(), &[]);
             assert!(r.is_err());
         }
     }

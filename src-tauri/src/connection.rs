@@ -336,6 +336,7 @@ pub fn find_java_home() -> String {
         }
     }
 
+    #[cfg(target_os = "macos")]
     if java_home.is_empty() {
         let out = Command::new("/usr/libexec/java_home")
             .args(["-v", "1.8"])
@@ -345,7 +346,7 @@ pub fn find_java_home() -> String {
                 match String::from_utf8(out.stdout) {
                     Ok(jh) => {
                         println!("/usr/libexec/java_home -v 1.8 returned {}", jh);
-                        java_home = jh;
+                        java_home = jh.trim().to_string();
                     }
                     Err(e) => {
                         println!("java_home output was not valid UTF-8: {}", e);
@@ -354,6 +355,34 @@ pub fn find_java_home() -> String {
             }
         }
     }
+
+    #[cfg(windows)]
+    if java_home.is_empty() {
+        // Derive JAVA_HOME from java.exe on PATH: ...\bin\java.exe → ...
+        let out = Command::new("where")
+            .arg("java")
+            .output();
+        if let Ok(out) = out {
+            if out.status.success() {
+                if let Ok(paths) = String::from_utf8(out.stdout) {
+                    // `where` can return multiple lines; use the first match
+                    if let Some(first) = paths.lines().next() {
+                        let java_path = PathBuf::from(first.trim());
+                        // java.exe is in <JAVA_HOME>/bin/java.exe
+                        if let Some(bin_dir) = java_path.parent() {
+                            if let Some(home_dir) = bin_dir.parent() {
+                                if let Some(home_str) = home_dir.to_str() {
+                                    println!("derived JAVA_HOME from PATH: {}", home_str);
+                                    java_home = home_str.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     java_home
 }
 
@@ -399,16 +428,36 @@ fn parse_trusted_certs(trusted_certs_location: &PathBuf) -> FxHashMap<String, X5
 }
 
 fn create_cert_store(certs: FxHashMap<String, X509>) -> X509Store {
-    if !openssl_probe::has_ssl_cert_env_vars() {
-        println!("probing and setting OpenSSL environment variables");
-        // SAFETY: must be called before any OpenSSL operations to set cert paths
-        unsafe { openssl_probe::init_openssl_env_vars(); }
-    }
     let mut cert_store_builder =
-        X509StoreBuilder::new().expect("unable to created X509 store builder");
-    cert_store_builder
-        .set_default_paths()
-        .expect("failed to load system default trusted certs");
+        X509StoreBuilder::new().expect("unable to create X509 store builder");
+
+    #[cfg(not(windows))]
+    {
+        if !openssl_probe::has_ssl_cert_env_vars() {
+            println!("probing and setting OpenSSL environment variables");
+            // SAFETY: must be called before any OpenSSL operations to set cert paths
+            unsafe { openssl_probe::init_openssl_env_vars(); }
+        }
+        cert_store_builder
+            .set_default_paths()
+            .expect("failed to load system default trusted certs");
+    }
+
+    #[cfg(windows)]
+    {
+        let mut loaded = 0usize;
+        if let Ok(win_store) = schannel::cert_store::CertStore::open_current_user("ROOT") {
+            for win_cert in win_store.certs() {
+                if let Ok(x509) = X509::from_der(win_cert.to_der()) {
+                    if cert_store_builder.add_cert(x509).is_ok() {
+                        loaded += 1;
+                    }
+                }
+            }
+        }
+        println!("loaded {} certificates from Windows certificate store", loaded);
+    }
+
     for (_, c) in certs {
         cert_store_builder
             .add_cert(c)

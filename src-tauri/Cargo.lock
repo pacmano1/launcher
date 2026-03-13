@@ -2337,7 +2337,7 @@ dependencies = [
 
 [[package]]
 name = "launcher"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "anyhow",
  "asn1-rs",
@@ -2349,6 +2349,7 @@ dependencies = [
  "reqwest 0.12.28",
  "roxmltree",
  "rustc-hash",
+ "schannel",
  "serde",
  "serde_json",
  "sha2",
