@@ -10,12 +10,13 @@ use std::path::PathBuf;
 use std::process::exit;
 use std::sync::Arc;
 
+use log::{info, warn};
 use serde_json::Number;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 
 use crate::connection::{ConnectionEntry, ConnectionStore};
-use crate::webstart::{WebstartCache, WebstartFile};
+use crate::webstart::{LoadConfig, WebstartCache, WebstartFile};
 
 mod connection;
 mod webstart;
@@ -29,7 +30,7 @@ async fn get_launcher_info() -> String {
         "launcher_version".to_string(),
         serde_json::Value::String(String::from(APP_VERSION)),
     );
-    return serde_json::to_string(&obj).unwrap_or_default();
+    serde_json::to_string(&obj).unwrap_or_default()
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -51,13 +52,22 @@ async fn launch(id: String, on_progress: Channel<serde_json::Value>, app: AppHan
             let address = address.clone();
             let cache_dir = cache_dir.clone();
             let logs_dir = logs_dir.clone();
-            move || WebstartFile::load(&address, &cache_dir, donotcache, &conn_id, &conn_name, &engine_type, &logs_dir, &on_progress)
+            move || WebstartFile::load(LoadConfig {
+                base_url: &address,
+                cache_dir: &cache_dir,
+                donotcache,
+                conn_id: &conn_id,
+                conn_name: &conn_name,
+                engine_type: &engine_type,
+                logs_dir: &logs_dir,
+                on_progress: &on_progress,
+            })
         }).await.map_err(|e| e.to_string())?;
 
         match tmp {
             Err(e) => {
                 let msg = e.to_string();
-                println!("{}", msg);
+                warn!("{}", msg);
                 return Ok(create_json_resp(-1, &msg));
             }
             Ok(wf) => {
@@ -80,7 +90,7 @@ async fn launch(id: String, on_progress: Channel<serde_json::Value>, app: AppHan
     let r = ws.run(ce, console_jar);
     if let Err(e) = r {
         let msg = e.to_string();
-        println!("{}", msg);
+        warn!("{}", msg);
         return Ok(create_json_resp(-1, &msg));
     }
 
@@ -136,18 +146,17 @@ fn import(file_path: &str, overwrite: bool, cs: State<ConnectionStore>) -> Resul
     cs.import(file_path, overwrite).map_err(|e| e.to_string())
 }
 
-
 fn main() {
     let env_fix = fix_path_env::fix_vars(&["JAVA_HOME", "PATH"]);
     if let Err(_e) = env_fix {
-        println!("failed to read JAVA_HOME and PATH environment variables");
+        eprintln!("failed to read JAVA_HOME and PATH environment variables");
     }
 
     let home_directory = home::home_dir().expect("unable to find the path to home directory");
     let launcher_directory = home_directory.join(".launcher");
     if let Err(e) = fs::create_dir(&launcher_directory) {
         if e.kind() != std::io::ErrorKind::AlreadyExists {
-            println!("failed to create .launcher directory: {}", e);
+            eprintln!("failed to create .launcher directory: {}", e);
             exit(1);
         }
     }
@@ -156,16 +165,13 @@ fn main() {
     let legacy_ballista_dir = home_directory.join(".ballista");
     if legacy_ballista_dir.exists() {
         move_file(legacy_ballista_dir.join("ballista-data.json"), launcher_directory.join("launcher-data.json"));
-        move_file(legacy_ballista_dir.join("ballista-trusted-certs.json"), launcher_directory.join("launcher-trusted-certs.json"));
     } else {
-        // Pre-ballista: loose files in home dir with catapult naming
         move_file(home_directory.join("catapult-data.json"), launcher_directory.join("launcher-data.json"));
-        move_file(home_directory.join("catapult-trusted-certs.json"), launcher_directory.join("launcher-trusted-certs.json"));
     }
 
     let connection_store = ConnectionStore::init(launcher_directory);
     if let Err(e) = connection_store {
-        println!("failed to initialize ConnectionStore: {}", e.to_string());
+        eprintln!("failed to initialize ConnectionStore: {}", e);
         exit(1);
     }
 
@@ -213,13 +219,10 @@ fn create_json_resp(code: i32, msg: &str) -> String {
 
 fn move_file(old: PathBuf, new: PathBuf) {
     if old.exists() && !new.exists() {
-        let r = fs::rename(&old, &new);
-        if let Err(e) = r {
-            println!(
+        if let Err(e) = fs::rename(&old, &new) {
+            info!(
                 "failed to move the file from {:?} to {:?} : {}",
-                old,
-                new,
-                e.to_string()
+                old, new, e
             );
         }
     }

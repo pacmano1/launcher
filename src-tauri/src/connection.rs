@@ -5,12 +5,12 @@
 use anyhow::Error;
 use home::env::Env;
 use home::env::OS_ENV;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
-use std::ops::Deref;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -21,7 +21,6 @@ pub struct ConnectionEntry {
     pub address: String,
     #[serde(rename = "heapSize")]
     pub heap_size: String,
-    pub icon: String,
     pub id: String,
     #[serde(rename = "javaHome")]
     pub java_home: String,
@@ -30,8 +29,6 @@ pub struct ConnectionEntry {
     pub name: String,
     pub username: Option<String>,
     pub password: Option<String>,
-    #[serde(default = "get_verify")]
-    pub verify: bool,
     #[serde(default = "get_default_group")]
     pub group: String,
     #[serde(default = "get_default_notes")]
@@ -55,18 +52,15 @@ pub struct ConnectionStore {
 
 impl Default for ConnectionEntry {
     fn default() -> Self {
-        let empty_str = String::from("");
         ConnectionEntry {
-            address: empty_str.clone(),
+            address: String::new(),
             heap_size: String::from("512m"),
-            icon: empty_str.clone(),
             id: Uuid::new_v4().to_string(),
             java_home: find_java_home(),
-            java_args: Option::from(empty_str.clone()),
-            name: empty_str.clone(),
+            java_args: Some(String::new()),
+            name: String::new(),
             username: None,
             password: None,
-            verify: true,
             group: get_default_group(),
             notes: get_default_notes(),
             donotcache: get_default_donotcache(),
@@ -96,7 +90,7 @@ impl ConnectionStore {
                 }
             }
             Err(e) => {
-                println!("{}", e);
+                info!("{}", e);
             }
         }
 
@@ -120,28 +114,13 @@ impl ConnectionStore {
 
     pub fn to_json_array_string(&self) -> String {
         let cache = self.con_cache.lock().expect("connection cache lock poisoned");
-        let mut sb = String::with_capacity(1024);
-        let len = cache.len();
-        sb.push('[');
-        for (pos, ce) in cache.values().enumerate() {
-            let c = serde_json::to_string(ce).unwrap_or_default();
-            sb.push_str(c.as_str());
-            if pos + 1 < len {
-                sb.push(',');
-            }
-        }
-        sb.push(']');
-
-        sb
+        let entries: Vec<&Arc<ConnectionEntry>> = cache.values().collect();
+        serde_json::to_string(&entries).unwrap_or_else(|_| String::from("[]"))
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<ConnectionEntry>> {
         let cs = self.con_cache.lock().expect("connection cache lock poisoned");
-        let val = cs.get(id);
-        if let Some(val) = val {
-            return Some(Arc::clone(val));
-        }
-        None
+        cs.get(id).map(Arc::clone)
     }
 
     pub fn save(&self, mut ce: ConnectionEntry) -> Result<String, Error> {
@@ -188,16 +167,15 @@ impl ConnectionStore {
         let f = File::open(file_path)?;
         let data: Vec<ConnectionEntry> = serde_json::from_reader(f)?;
 
-        // Check for collisions with existing connections
-        let cache = self.con_cache.lock().expect("connection cache lock poisoned");
+        let mut cache = self.con_cache.lock().expect("connection cache lock poisoned");
         let duplicates: Vec<String> = data
             .iter()
             .filter(|ce| cache.contains_key(&ce.id))
             .map(|ce| ce.name.clone())
             .collect();
-        drop(cache);
 
         if !duplicates.is_empty() && !overwrite {
+            drop(cache);
             let result = serde_json::json!({
                 "status": "duplicates",
                 "names": duplicates,
@@ -206,16 +184,13 @@ impl ConnectionStore {
             return Ok(result.to_string());
         }
 
-        let mut count = 0;
         let java_home = find_java_home();
+        let count = data.len();
         for mut ce in data {
             ce.java_home = java_home.clone();
-            self.con_cache
-                .lock()
-                .expect("connection cache lock poisoned")
-                .insert(ce.id.clone(), Arc::new(ce));
-            count += 1;
+            cache.insert(ce.id.clone(), Arc::new(ce));
         }
+        drop(cache);
 
         self.write_connections_to_disk()?;
         let result = serde_json::json!({
@@ -227,17 +202,11 @@ impl ConnectionStore {
 
     fn write_connections_to_disk(&self) -> Result<(), Error> {
         let c = self.con_cache.lock().expect("connection cache lock poisoned");
-        let val = serde_json::to_string_pretty(c.deref())?;
-        let mut f = OpenOptions::new()
-            .append(false)
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.con_location)
-            .map_err(|e| {
-                println!("unable to open file for writing: {}", e);
-                Error::new(e)
-            })?;
+        let val = serde_json::to_string_pretty(&*c)?;
+        let mut f = File::create(&self.con_location).map_err(|e| {
+            warn!("unable to open file for writing: {}", e);
+            Error::new(e)
+        })?;
         f.write_all(val.as_bytes())?;
         Ok(())
     }
@@ -265,17 +234,8 @@ impl ConnectionStore {
             .expect("connection cache lock poisoned");
 
         let mut groups: HashSet<String> = HashSet::new();
-
-        // Ensure default group
         groups.insert(get_default_group());
-
-        let collected_groups: HashSet<String> = connections
-            .values()
-            .map(|connection_entry| connection_entry.group.clone())  // extract the property
-            .collect();
-
-        groups.extend(collected_groups);
-
+        groups.extend(connections.values().map(|ce| ce.group.clone()));
         Ok(groups)
     }
 
@@ -285,29 +245,20 @@ impl ConnectionStore {
             .expect("connection cache lock poisoned");
 
         let mut engine_types: HashSet<String> = HashSet::new();
-
-        // Ensure default engine type
         engine_types.insert(get_default_engine_type());
-
-        let collected: HashSet<String> = connections
-            .values()
-            .map(|ce| ce.engine_type.clone())
-            .collect();
-
-        engine_types.extend(collected);
-
+        engine_types.extend(connections.values().map(|ce| ce.engine_type.clone()));
         Ok(engine_types)
     }
 }
 
 pub fn find_java_home() -> String {
-    let mut java_home = String::from("");
+    let mut java_home = String::new();
     if let Some(jh) = OS_ENV.var_os("JAVA_HOME") {
         if let Some(jh_str) = jh.to_str() {
             java_home = String::from(jh_str);
-            println!("JAVA_HOME is set to {}", java_home);
+            info!("JAVA_HOME is set to {}", java_home);
         } else {
-            println!("JAVA_HOME contains non-UTF-8 characters, ignoring");
+            warn!("JAVA_HOME contains non-UTF-8 characters, ignoring");
         }
     }
 
@@ -320,11 +271,11 @@ pub fn find_java_home() -> String {
             if out.status.success() {
                 match String::from_utf8(out.stdout) {
                     Ok(jh) => {
-                        println!("/usr/libexec/java_home -v 1.8 returned {}", jh);
+                        info!("/usr/libexec/java_home -v 1.8 returned {}", jh);
                         java_home = jh.trim().to_string();
                     }
                     Err(e) => {
-                        println!("java_home output was not valid UTF-8: {}", e);
+                        warn!("java_home output was not valid UTF-8: {}", e);
                     }
                 }
             }
@@ -333,21 +284,18 @@ pub fn find_java_home() -> String {
 
     #[cfg(windows)]
     if java_home.is_empty() {
-        // Derive JAVA_HOME from java.exe on PATH: ...\bin\java.exe → ...
         let out = Command::new("where")
             .arg("java")
             .output();
         if let Ok(out) = out {
             if out.status.success() {
                 if let Ok(paths) = String::from_utf8(out.stdout) {
-                    // `where` can return multiple lines; use the first match
                     if let Some(first) = paths.lines().next() {
                         let java_path = PathBuf::from(first.trim());
-                        // java.exe is in <JAVA_HOME>/bin/java.exe
                         if let Some(bin_dir) = java_path.parent() {
                             if let Some(home_dir) = bin_dir.parent() {
                                 if let Some(home_str) = home_dir.to_str() {
-                                    println!("derived JAVA_HOME from PATH: {}", home_str);
+                                    info!("derived JAVA_HOME from PATH: {}", home_str);
                                     java_home = home_str.to_string();
                                 }
                             }
@@ -361,16 +309,12 @@ pub fn find_java_home() -> String {
     java_home
 }
 
-fn get_verify() -> bool {
-    true
-}
-
 fn get_default_group() -> String {
     String::from("Default")
 }
 
 fn get_default_notes() -> String {
-    String::from("")
+    String::new()
 }
 
 fn get_default_donotcache() -> bool {

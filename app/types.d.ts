@@ -5,14 +5,12 @@ export interface LauncherInfo {
 export interface Connection {
   address: string
   heapSize: string
-  icon: string
   id: string
   javaHome: string
   javaArgs: string
   name: string
   username: string
   password: string
-  verify: boolean
   group: string
   notes: string
   donotcache: boolean
