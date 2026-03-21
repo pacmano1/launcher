@@ -6,8 +6,6 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -26,10 +24,6 @@ use crate::connection::ConnectionEntry;
 
 /// How long a cached WebstartFile remains valid before re-fetching (seconds)
 const WEBSTART_CACHE_TTL_SECS: u64 = 120;
-
-/// Windows: CREATE_NO_WINDOW flag to suppress console window
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 /// Configuration for loading a WebstartFile, replacing a long parameter list.
 pub struct LoadConfig<'a> {
@@ -240,10 +234,11 @@ impl WebstartFile {
         let classpath = mirth_jars.join(classpath_separator);
 
         let java_home = ce.java_home.trim();
+        let java_executable = if cfg!(windows) { "javaw" } else { "java" };
         let mut cmd = if java_home.is_empty() {
-            Command::new("java")
+            Command::new(java_executable)
         } else {
-            Command::new(PathBuf::from(java_home).join("bin").join("java"))
+            Command::new(PathBuf::from(java_home).join("bin").join(java_executable))
         };
 
         info!("using java from: {:?}", cmd.get_program().to_str());
@@ -291,30 +286,44 @@ impl WebstartFile {
                 .ok_or(Error::msg("Java console jar path not provided"))?;
 
             let java_bin = if java_home.is_empty() {
-                PathBuf::from("java")
+                PathBuf::from(java_executable)
             } else {
-                PathBuf::from(java_home).join("bin").join("java")
+                PathBuf::from(java_home).join("bin").join(java_executable)
             };
 
             let mut console_cmd = Command::new(&java_bin);
             console_cmd
+                .arg("-Djava.awt.headless=false")
                 .arg("-Xmx256m")
                 .arg("-cp")
                 .arg(console_jar.to_str().ok_or_else(|| Error::msg("console jar path is not valid UTF-8"))?)
                 .arg("com.innovarhealthcare.launcher.JavaConsoleDialog")
                 .stdin(Stdio::piped());
-            #[cfg(windows)]
-            console_cmd.creation_flags(CREATE_NO_WINDOW);
             let mut console_proc = console_cmd.spawn()?;
 
-            cmd.stdout(Stdio::piped());
-            #[cfg(windows)]
-            cmd.creation_flags(CREATE_NO_WINDOW);
+            cmd.stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             let mut target_proc = cmd.spawn()?;
 
             let target_stdout = target_proc.stdout.take();
+            let target_stderr = target_proc.stderr.take();
             let console_stdin = console_proc.stdin.take();
             if let (Some(stdout), Some(stdin)) = (target_stdout, console_stdin) {
+                // Pipe stderr to console in a separate thread
+                if let Some(stderr) = target_stderr {
+                    std::thread::spawn(move || {
+                        use std::io::Read;
+                        let mut stderr = stderr;
+                        let mut buf = [0u8; 1024];
+                        loop {
+                            match stderr.read(&mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {}
+                            }
+                        }
+                    });
+                }
+                // Pipe stdout to console stdin
                 std::thread::spawn(move || {
                     use std::io::{Read, Write};
                     let mut stdout = stdout;
@@ -347,8 +356,6 @@ impl WebstartFile {
                     cmd.stderr(Stdio::inherit());
                 }
             }
-            #[cfg(windows)]
-            cmd.creation_flags(CREATE_NO_WINDOW);
             info!("launching: {:?}", cmd);
             cmd.spawn()?;
         }
