@@ -11,7 +11,7 @@ type SortMode = "group" | "name" | "lastConnected" | "status"
 const isLoading = ref<boolean>(false)
 const progressMessage = ref<string>("Connecting...")
 const launchError = ref<string | null>(null)
-const searchFilter = ref<string>("")
+const searchFilter = ref<string>(localStorage.getItem("launcher-search") || "")
 const selectedServerId = ref<string | null>(null)
 const sortBy = ref<SortMode>((localStorage.getItem("launcher-sort") as SortMode) || "group")
 const showSortMenu = ref(false)
@@ -20,6 +20,8 @@ watch(sortBy, (v) => {
   localStorage.setItem("launcher-sort", v)
   showSortMenu.value = false
 })
+
+watch(searchFilter, (v) => localStorage.setItem("launcher-search", v))
 
 const servers: Connection[] = JSON.parse(await invoke("load_connections"))
 
@@ -92,7 +94,6 @@ const toggleGroup = (group: string) => {
 const hasServers = computed(() => servers.length > 0)
 const hasResults = computed(() => filteredServers.value.length > 0)
 
-const { trustCertificate } = useConfirmRejectModal()
 const handleLaunchClick = (connection: Connection) => {
   isLoading.value = true
   launchError.value = null
@@ -107,22 +108,10 @@ const launchServer = async (connection: Connection) => {
   }
 
   try {
-    // Loop to handle multiple untrusted certs across different jars
-    while (true) {
-      const response: string = await invoke("launch", {
-        id: connection.id,
-        on_progress: onProgress,
-      })
-      const result = JSON.parse(response)
-
-      // Result code 1 means cert needs trust approval
-      if (result.code !== 1) return
-
-      const shouldTrustCertificate = await trustCertificate(result.cert)
-      if (!shouldTrustCertificate) return
-
-      await invoke("trust_cert", { cert: result.cert.der })
-    }
+    await invoke("launch", {
+      id: connection.id,
+      on_progress: onProgress,
+    })
   } catch (e) {
     launchError.value = `Launch failed: ${e}`
   } finally {

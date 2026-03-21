@@ -6,15 +6,13 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 use anyhow::Error;
-use openssl::x509::store::X509StoreRef;
-use openssl::x509::X509;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use log::info;
 use reqwest::blocking::{Client, ClientBuilder};
 use reqwest::Url;
 use roxmltree::Node;
@@ -23,23 +21,24 @@ use sha2::{Digest, Sha256};
 use tauri::ipc::Channel;
 
 use crate::connection::ConnectionEntry;
-use crate::errors::VerificationError;
-use crate::verify::verify_jar;
 
 /// How long a cached WebstartFile remains valid before re-fetching (seconds)
 const WEBSTART_CACHE_TTL_SECS: u64 = 120;
 
-/// Maximum concurrent download threads for JAR retrieval
-const DOWNLOAD_THREADS: usize = 4;
-
-/// Windows: CREATE_NO_WINDOW flag to suppress console window
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+/// Configuration for loading a WebstartFile, replacing a long parameter list.
+pub struct LoadConfig<'a> {
+    pub base_url: &'a str,
+    pub cache_dir: &'a PathBuf,
+    pub donotcache: bool,
+    pub conn_id: &'a str,
+    pub conn_name: &'a str,
+    pub engine_type: &'a str,
+    pub logs_dir: &'a PathBuf,
+    pub on_progress: &'a Channel<serde_json::Value>,
+}
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct WebstartFile {
-    url: String,
     main_class: String,
     args: Vec<String>,
     j2ses: Option<Vec<J2se>>,
@@ -49,15 +48,9 @@ pub struct WebstartFile {
     loaded_at: SystemTime,
 }
 
-#[derive(Debug)]
-struct VendorInfo {
-    vendor: String,
-    version: String,
-}
-
 /// from jnlp -> resources -> j2se
 #[derive(Debug)]
-pub struct J2se {
+struct J2se {
     java_vm_args: Option<String>,
     version: String,
 }
@@ -94,17 +87,13 @@ impl WebstartCache {
 }
 
 impl WebstartFile {
-    pub fn load(base_url: &str, cache_dir: &PathBuf, donotcache: bool, conn_id: &str, conn_name: &str, logs_dir: &PathBuf, on_progress: &Channel<serde_json::Value>) -> Result<WebstartFile, Error> {
-        let (base_url, _host) = normalize_url(base_url)?;
-        let webstart = format!("{}/webstart.jnlp", base_url); // base_url will never contain a / at the end after normalization
-        let _ = on_progress.send(serde_json::json!({"message": "Fetching server configuration..."}));
-        let cb = ClientBuilder::default()
-            // in certain network environments client is failing with error message "connection closed before message completed"
-            // disabling the pooling resolved the issue
-            .pool_max_idle_per_host(0)
-            // accept any cert presented by the MC server
-            .danger_accept_invalid_certs(true);
-        let client = cb.build()?;
+    pub fn load(config: LoadConfig) -> Result<WebstartFile, Error> {
+        let base_url = normalize_url(config.base_url)?;
+        let webstart = format!("{}/webstart.jnlp", base_url);
+        let _ = config.on_progress.send(serde_json::json!({"message": "Fetching server configuration..."}));
+        let client = ClientBuilder::default()
+            .danger_accept_invalid_certs(true)
+            .build()?;
 
         let r = client.get(&webstart).send()?;
         let data = r.text()?;
@@ -125,71 +114,64 @@ impl WebstartFile {
         let mut jnlp_version = "default".to_string();
         if let Some(jnlp_node) = get_node(&root, "jnlp") {
             if let Some(v) = jnlp_node.attribute("version") {
-                // Sanitize to prevent path traversal (e.g. "../../.ssh")
                 jnlp_version = v.replace(['/', '\\', '.'], "_");
             }
         }
 
-        // Build jar_dir based on donotcache flag and vendor detection
-        let jar_dir = if donotcache {
-            // Isolated directory — wiped each launch, never touches shared cache
-            let dir = cache_dir.join("_isolated").join(conn_id);
+        // Build jar_dir based on donotcache flag and engine type
+        let jar_dir = if config.donotcache {
+            let dir = config.cache_dir.join("_isolated").join(config.conn_id);
             if dir.exists() {
-                println!("removing isolated cache directory {:?}", dir);
+                info!("removing isolated cache directory {:?}", dir);
                 std::fs::remove_dir_all(&dir)?;
             }
             dir
         } else {
-            // Try to detect vendor and version from /api endpoint
-            let _ = on_progress.send(serde_json::json!({"message": "Detecting server version..."}));
-            match fetch_vendor_info(&client, &base_url) {
-                Some(info) => {
-                    println!("detected vendor: {} version: {}", info.vendor, info.version);
-                    cache_dir.join(&info.vendor).join(&info.version)
-                }
-                None => {
-                    println!("could not detect vendor info, using fallback cache path");
-                    cache_dir.join("_unknown").join(&jnlp_version)
-                }
-            }
+            let vendor = sanitize_for_path(config.engine_type);
+            info!("using engine type for cache: {} (sanitized: {})", config.engine_type, vendor);
+            config.cache_dir.join(&vendor).join(&jnlp_version)
         };
 
         if !jar_dir.exists() {
-            println!("creating directory {:?}", jar_dir);
+            info!("creating directory {:?}", jar_dir);
             std::fs::create_dir_all(&jar_dir)?;
+        }
+
+        // Create core/ and extensions/ subdirectories
+        let core_dir = jar_dir.join("core");
+        if !core_dir.exists() {
+            std::fs::create_dir_all(&core_dir)?;
         }
 
         let mut j2ses = None;
         if let Some(resources_node) = resources_node {
             j2ses = get_j2ses(&resources_node);
-            download_jars(&resources_node, &client, jar_dir.as_path(), &base_url, on_progress)?;
+            download_jars(&resources_node, &client, &jar_dir, &base_url, config.on_progress)?;
         }
 
         // Migration: clean up old per-connection cache directory
-        if !donotcache {
-            let sanitized_name = conn_name
+        if !config.donotcache {
+            let sanitized_name = config.conn_name
                 .to_lowercase()
                 .chars()
                 .map(|c| if c.is_alphanumeric() { c } else { '-' })
                 .collect::<String>();
-            let id_prefix = &conn_id[..conn_id.len().min(8)];
+            let id_prefix = &config.conn_id[..config.conn_id.len().min(8)];
             let old_cache_folder = format!("{}_{}", sanitized_name, id_prefix);
-            let old_jar_dir = cache_dir.join(old_cache_folder);
+            let old_jar_dir = config.cache_dir.join(old_cache_folder);
             if old_jar_dir.exists() {
-                println!("migrating: removing old cache directory {:?}", old_jar_dir);
+                info!("migrating: removing old cache directory {:?}", old_jar_dir);
                 let _ = std::fs::remove_dir_all(&old_jar_dir);
             }
         }
 
-        let loaded_at = SystemTime::now();
         let ws = WebstartFile {
-            url: base_url.to_string(),
             main_class,
             jar_dir,
-            logs_dir: logs_dir.clone(),
-            conn_id: conn_id.to_string(),
+            logs_dir: config.logs_dir.clone(),
+            conn_id: config.conn_id.to_string(),
             args,
-            loaded_at,
+            loaded_at: SystemTime::now(),
             j2ses,
         };
 
@@ -197,34 +179,51 @@ impl WebstartFile {
     }
 
     pub fn run(&self, ce: Arc<ConnectionEntry>, console_jar: Option<PathBuf>) -> Result<(), Error> {
-        let itr = self.jar_dir.read_dir()?;
         let mut mirth_jars = Vec::new();
         let mut other_jars = Vec::new();
-        for e in itr {
-            let e = e?;
-            if e.metadata()?.is_dir() {
-                continue;
-            }
-            let file_path = e.path();
-            if file_path.extension().and_then(|e| e.to_str()) != Some("jar") {
-                continue;
-            }
-            let file_name = match file_path.file_name().and_then(|f| f.to_str()) {
-                Some(name) => name.to_string(),
-                None => continue,
-            };
-            let file_path_str = match file_path.to_str() {
-                Some(p) => p.to_string(),
-                None => continue,
-            };
 
-            // MirthConnect's own jars contain some overridden classes
-            // of the dependent libraries and hence must be loaded first
-            // https://forums.mirthproject.io/forum/mirth-connect/support/15524-using-com-mirth-connect-client-core-client
-            if file_name.starts_with("mirth") {
-                mirth_jars.push(file_path_str);
-            } else {
-                other_jars.push(file_path_str);
+        // Collect JARs from core/ and extensions/*/
+        let mut dirs_to_scan = vec![self.jar_dir.join("core")];
+        let ext_dir = self.jar_dir.join("extensions");
+        if ext_dir.exists() {
+            for entry in ext_dir.read_dir()? {
+                let entry = entry?;
+                if entry.metadata()?.is_dir() {
+                    dirs_to_scan.push(entry.path());
+                }
+            }
+        }
+
+        for dir in &dirs_to_scan {
+            if !dir.exists() {
+                continue;
+            }
+            for e in dir.read_dir()? {
+                let e = e?;
+                if e.metadata()?.is_dir() {
+                    continue;
+                }
+                let file_path = e.path();
+                if file_path.extension().and_then(|e| e.to_str()) != Some("jar") {
+                    continue;
+                }
+                let file_name = match file_path.file_name().and_then(|f| f.to_str()) {
+                    Some(name) => name.to_string(),
+                    None => continue,
+                };
+                let file_path_str = match file_path.to_str() {
+                    Some(p) => p.to_string(),
+                    None => continue,
+                };
+
+                // MirthConnect's own jars contain some overridden classes
+                // of the dependent libraries and hence must be loaded first
+                // https://forums.mirthproject.io/forum/mirth-connect/support/15524-using-com-mirth-connect-client-core-client
+                if file_name.starts_with("mirth") {
+                    mirth_jars.push(file_path_str);
+                } else {
+                    other_jars.push(file_path_str);
+                }
             }
         }
 
@@ -234,27 +233,23 @@ impl WebstartFile {
         mirth_jars.extend(other_jars);
         let classpath = mirth_jars.join(classpath_separator);
 
-        let mut cmd;
         let java_home = ce.java_home.trim();
-        if java_home.is_empty() {
-            cmd = Command::new("java")
+        let java_executable = if cfg!(windows) { "javaw" } else { "java" };
+        let mut cmd = if java_home.is_empty() {
+            Command::new(java_executable)
         } else {
-            let java_bin = PathBuf::from(java_home).join("bin").join("java");
-            cmd = Command::new(java_bin);
-        }
+            Command::new(PathBuf::from(java_home).join("bin").join(java_executable))
+        };
 
-        println!("using java from: {:?}", cmd.get_program().to_str());
+        info!("using java from: {:?}", cmd.get_program().to_str());
 
         if let Some(ref vm_args) = self.j2ses {
             for va in vm_args {
-                // if there are VM args for java version >= 1.9
-                // then set the JDK_JAVA_OPTIONS environment variable
-                // this will be ignored by java version <= 1.8
                 if va.version.contains("1.9") {
                     if let Some(java_vm_args) = &va.java_vm_args {
                         let filtered = sanitize_vm_args(java_vm_args);
                         if !filtered.is_empty() {
-                            println!("setting JDK_JAVA_OPTIONS environment variable with the java-vm-args given for version {} in JNLP file", va.version);
+                            info!("setting JDK_JAVA_OPTIONS for version {}", va.version);
                             cmd.env("JDK_JAVA_OPTIONS", &filtered);
                         }
                     }
@@ -290,35 +285,45 @@ impl WebstartFile {
             let console_jar = console_jar
                 .ok_or(Error::msg("Java console jar path not provided"))?;
 
-            // Launch the Java Console as a separate Java Swing process
             let java_bin = if java_home.is_empty() {
-                PathBuf::from("java")
+                PathBuf::from(java_executable)
             } else {
-                PathBuf::from(java_home).join("bin").join("java")
+                PathBuf::from(java_home).join("bin").join(java_executable)
             };
 
             let mut console_cmd = Command::new(&java_bin);
             console_cmd
+                .arg("-Djava.awt.headless=false")
                 .arg("-Xmx256m")
                 .arg("-cp")
                 .arg(console_jar.to_str().ok_or_else(|| Error::msg("console jar path is not valid UTF-8"))?)
                 .arg("com.innovarhealthcare.launcher.JavaConsoleDialog")
                 .stdin(Stdio::piped());
-            #[cfg(windows)]
-            console_cmd.creation_flags(CREATE_NO_WINDOW);
             let mut console_proc = console_cmd.spawn()?;
 
-            // Launch the target process with stdout piped to the console
-            // stderr inherits (default) so it doesn't block the process
-            cmd.stdout(Stdio::piped());
-            #[cfg(windows)]
-            cmd.creation_flags(CREATE_NO_WINDOW);
+            cmd.stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             let mut target_proc = cmd.spawn()?;
 
-            // Pipe target stdout → console stdin in a background thread
             let target_stdout = target_proc.stdout.take();
+            let target_stderr = target_proc.stderr.take();
             let console_stdin = console_proc.stdin.take();
             if let (Some(stdout), Some(stdin)) = (target_stdout, console_stdin) {
+                // Pipe stderr to console in a separate thread
+                if let Some(stderr) = target_stderr {
+                    std::thread::spawn(move || {
+                        use std::io::Read;
+                        let mut stderr = stderr;
+                        let mut buf = [0u8; 1024];
+                        loop {
+                            match stderr.read(&mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {}
+                            }
+                        }
+                    });
+                }
+                // Pipe stdout to console stdin
                 std::thread::spawn(move || {
                     use std::io::{Read, Write};
                     let mut stdout = stdout;
@@ -334,7 +339,6 @@ impl WebstartFile {
                             Err(_) => break,
                         }
                     }
-                    // Target process exited — kill the console window
                     let _ = console_proc.kill();
                 });
             }
@@ -352,103 +356,12 @@ impl WebstartFile {
                     cmd.stderr(Stdio::inherit());
                 }
             }
-            #[cfg(windows)]
-            cmd.creation_flags(CREATE_NO_WINDOW);
-            println!("launching: {:?}", cmd);
+            info!("launching: {:?}", cmd);
             cmd.spawn()?;
         }
 
         Ok(())
     }
-
-    pub fn verify(&self, cert_store: &X509StoreRef, trusted_certs: &[X509]) -> Result<(), VerificationError> {
-        let mut jar_files = Vec::with_capacity(128);
-        let itr = self
-            .jar_dir
-            .read_dir()
-            .map_err(|e| VerificationError {
-                cert: None,
-                msg: format!("failed to read jar files directory: {}", e),
-            })?;
-        for e in itr {
-            let e = e.map_err(|e| VerificationError {
-                cert: None,
-                msg: format!("failed to list directory entry: {}", e),
-            })?;
-            let file_path = e.path();
-            if file_path.extension().and_then(|e| e.to_str()) == Some("jar") {
-                jar_files.push(file_path);
-            }
-        }
-
-        jar_files.sort_unstable();
-        println!("{:?}", jar_files);
-
-        let mut verified_count = 0usize;
-        let mut skipped_count = 0usize;
-        for jf in &jar_files {
-            let file_path = jf.to_str().ok_or_else(|| VerificationError {
-                cert: None,
-                msg: format!("jar file path is not valid UTF-8: {:?}", jf),
-            })?;
-            // Read the JAR into memory once — used for both hashing and verification
-            let jar_data = std::fs::read(jf).map_err(|e| VerificationError {
-                cert: None,
-                msg: format!("failed to read jar file {:?}: {}", jf, e),
-            })?;
-            let mut hasher = Sha256::new();
-            hasher.update(&jar_data);
-            let hash = openssl::base64::encode_block(hasher.finalize().as_slice());
-
-            let sidecar = jf.with_extension("jar.verified");
-            if let Ok(stored) = std::fs::read_to_string(&sidecar) {
-                if stored.trim() == hash {
-                    skipped_count += 1;
-                    println!("skipping verification of {} (already verified)", file_path);
-                    continue;
-                }
-            }
-
-            verify_jar(file_path, &jar_data, cert_store, trusted_certs)?;
-            let _ = std::fs::write(&sidecar, &hash);
-            verified_count += 1;
-        }
-        println!("verification complete: {} verified, {} skipped (unchanged)", verified_count, skipped_count);
-        Ok(())
-    }
-}
-
-/// Fetch vendor name and version from the server's OpenAPI spec at /api.
-/// Returns None if the endpoint is unreachable or returns unexpected format.
-fn fetch_vendor_info(client: &Client, base_url: &str) -> Option<VendorInfo> {
-    let api_url = format!("{}/api", base_url);
-    let resp = client
-        .get(&api_url)
-        .header("Accept", "application/json")
-        .header("X-Requested-With", "XMLHttpRequest")
-        .send()
-        .ok()?;
-
-    if !resp.status().is_success() {
-        println!("vendor info: /api returned status {}", resp.status());
-        return None;
-    }
-
-    let text = resp.text().ok()?;
-    let body: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let info = body.get("info")?;
-    let title = info.get("title")?.as_str()?;
-    let version = info.get("version")?.as_str()?;
-
-    let vendor = sanitize_for_path(title);
-    let version = sanitize_for_path(version);
-
-    if vendor.is_empty() || version.is_empty() {
-        println!("vendor info: empty vendor or version after sanitization");
-        return None;
-    }
-
-    Some(VendorInfo { vendor, version })
 }
 
 /// Sanitize a string for use as a filesystem path component.
@@ -476,7 +389,6 @@ fn sanitize_for_path(s: &str) -> String {
 struct JarTask {
     url: String,
     file_path: PathBuf,
-    file_name: String,
     hash: Option<String>,
 }
 
@@ -487,16 +399,15 @@ fn download_jars(
     base_url: &str,
     on_progress: &Channel<serde_json::Value>,
 ) -> Result<(), Error> {
-    // Phase 1: collect all JAR tasks, resolving extensions sequentially
     let mut tasks = Vec::new();
-    collect_jar_tasks(resources_node, client, dir_path, base_url, &mut tasks, on_progress)?;
+    let core_dir = dir_path.join("core");
+    collect_jar_tasks(resources_node, client, &core_dir, base_url, dir_path, &mut tasks, on_progress)?;
 
-    // Phase 2: check cache and build download list
+    let _ = on_progress.send(serde_json::json!({
+        "message": format!("Checking {} cached files...", tasks.len()),
+    }));
     let mut to_download = Vec::new();
     for task in &tasks {
-        let _ = on_progress.send(serde_json::json!({
-            "message": format!("Verifying cache file {}", task.file_name),
-        }));
         if has_file_changed(&task.file_path, task.hash.as_deref())? {
             to_download.push(task);
         }
@@ -507,64 +418,27 @@ fn download_jars(
     }
 
     let total = to_download.len();
-    let _ = on_progress.send(serde_json::json!({
-        "message": format!("Downloading {} JARs...", total),
-    }));
-
-    // Phase 3: download in parallel
-    let completed = AtomicUsize::new(0);
-    let first_error: Mutex<Option<Error>> = Mutex::new(None);
-
-    std::thread::scope(|s| {
-        let num_threads = to_download.len().min(DOWNLOAD_THREADS);
-        let chunk_size = (to_download.len() + num_threads - 1) / num_threads;
-        for chunk in to_download.chunks(chunk_size) {
-            let client = client;
-            let completed = &completed;
-            let first_error = &first_error;
-            let on_progress = on_progress;
-            s.spawn(move || {
-                for task in chunk {
-                    // Stop if another thread hit an error
-                    if first_error.lock().expect("error lock poisoned").is_some() {
-                        return;
-                    }
-                    let result = (|| -> Result<(), Error> {
-                        let mut resp = client.get(&task.url).send()?;
-                        let mut f = File::create(&task.file_path)?;
-                        resp.copy_to(&mut f)?;
-                        let _ = std::fs::remove_file(task.file_path.with_extension("jar.verified"));
-                        let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                        let _ = on_progress.send(serde_json::json!({
-                            "message": format!("Downloaded {} ({}/{})", task.file_name, done, total),
-                        }));
-                        Ok(())
-                    })();
-                    if let Err(e) = result {
-                        let mut err = first_error.lock().expect("error lock poisoned");
-                        if err.is_none() {
-                            *err = Some(e);
-                        }
-                        return;
-                    }
-                }
-            });
-        }
-    });
-
-    let err = first_error.into_inner().expect("error lock poisoned");
-    if let Some(e) = err {
-        return Err(e);
+    for (i, task) in to_download.iter().enumerate() {
+        let mut resp = client.get(&task.url).send()?;
+        let mut f = File::create(&task.file_path)?;
+        resp.copy_to(&mut f)?;
+        let _ = on_progress.send(serde_json::json!({
+            "message": format!("Downloaded ({}/{})", i + 1, total),
+        }));
     }
 
     Ok(())
 }
 
+/// Collect JAR download tasks from a JNLP resources node.
+/// `jar_output_dir` is where JAR files for this level are stored.
+/// `cache_root` is the top-level cache dir (for creating extension subdirectories).
 fn collect_jar_tasks(
     resources_node: &Node,
     client: &Client,
-    dir_path: &Path,
+    jar_output_dir: &Path,
     base_url: &str,
+    cache_root: &Path,
     tasks: &mut Vec<JarTask>,
     on_progress: &Channel<serde_json::Value>,
 ) -> Result<(), Error> {
@@ -583,33 +457,29 @@ fn collect_jar_tasks(
         let url = format!("{}/{}", base_url, href);
 
         if jar {
-            let file_name = get_file_name_from_path(href).to_string();
-            let file_path = dir_path.join(&file_name);
+            let file_name = get_file_name_from_path(href);
+            let file_path = jar_output_dir.join(file_name);
             let hash = n.attribute("sha256").map(|s| s.to_string());
-            tasks.push(JarTask { url, file_path, file_name, hash });
+            tasks.push(JarTask { url, file_path, hash });
         } else if extension {
             let ext_name = get_file_name_from_path(href);
-            let ext_cache_path = dir_path.join(ext_name);
-            let data = if ext_cache_path.exists() {
-                let _ = on_progress.send(serde_json::json!({
-                    "message": format!("Loading cached extension {}...", ext_name),
-                }));
-                std::fs::read_to_string(&ext_cache_path)?
-            } else {
-                let _ = on_progress.send(serde_json::json!({
-                    "message": format!("Fetching extension {}...", ext_name),
-                }));
-                let r = client.get(url).send()?;
-                let body = r.text()?;
-                let _ = std::fs::write(&ext_cache_path, &body);
-                body
-            };
+            let ext_dir_name = ext_name.strip_suffix(".jnlp").unwrap_or(ext_name);
+            let ext_dir = cache_root.join("extensions").join(ext_dir_name);
+            if !ext_dir.exists() {
+                std::fs::create_dir_all(&ext_dir)?;
+            }
+
+            let _ = on_progress.send(serde_json::json!({
+                "message": format!("Fetching extension {}...", ext_dir_name),
+            }));
+            let r = client.get(url).send()?;
+            let data = r.text()?;
+
             let doc = roxmltree::Document::parse(&data)?;
             let root = doc.root();
-            let resources_node = get_node(&root, "resources");
             let ext_base_url = format!("{}/webstart/extensions", base_url);
-            if let Some(resources_node) = resources_node {
-                collect_jar_tasks(&resources_node, client, dir_path, &ext_base_url, tasks, on_progress)?;
+            if let Some(resources_node) = get_node(&root, "resources") {
+                collect_jar_tasks(&resources_node, client, &ext_dir, &ext_base_url, cache_root, tasks, on_progress)?;
             }
         }
     }
@@ -624,19 +494,17 @@ fn sanitize_vm_args(args: &str) -> String {
         "-agentlib:",
         "-xbootclasspath",
         "-xx:onoutofmemoryerror",
-        "-xx:onoutofmemoryerror=",
         "-xx:onerror",
-        "-xx:onerror=",
     ];
 
     args.split_whitespace()
         .filter(|arg| {
             let lower = arg.to_lowercase();
-            let dominated = dangerous_prefixes.iter().any(|p| lower.starts_with(p));
-            if dominated {
-                println!("sanitize_vm_args: dropping dangerous flag: {}", arg);
+            let blocked = dangerous_prefixes.iter().any(|p| lower.starts_with(p));
+            if blocked {
+                info!("sanitize_vm_args: dropping dangerous flag: {}", arg);
             }
-            !dominated
+            !blocked
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -647,72 +515,52 @@ fn get_file_name_from_path(p: &str) -> &str {
 }
 
 fn get_client_args(root: &Node) -> Vec<String> {
-    let mut args = Vec::new();
-    for n in root.descendants() {
-        if n.has_tag_name("argument") {
-            if let Some(text) = n.text() {
-                args.push(text.to_string());
-            }
-        }
-    }
-    args
+    root.descendants()
+        .filter(|n| n.has_tag_name("argument"))
+        .filter_map(|n| n.text().map(|t| t.to_string()))
+        .collect()
 }
 
 fn get_j2ses(resources: &Node) -> Option<Vec<J2se>> {
-    let mut j2ses = Vec::new();
-    for n in resources.descendants() {
-        if n.has_tag_name("j2se") {
-            // only consider those that have java-vm-args and version
-            if let Some(java_vm_args) = n.attribute("java-vm-args") {
-                if let Some(version) = n.attribute("version") {
-                    let java_vm_args = Some(java_vm_args.to_string());
-                    let j2se = J2se {
-                        java_vm_args,
-                        version: version.to_string(),
-                    };
-                    j2ses.push(j2se);
-                }
-            }
-        }
-    }
-    if !j2ses.is_empty() {
-        return Some(j2ses);
-    }
-    None
+    let j2ses: Vec<J2se> = resources
+        .descendants()
+        .filter(|n| n.has_tag_name("j2se"))
+        .filter_map(|n| {
+            let java_vm_args = n.attribute("java-vm-args")?;
+            let version = n.attribute("version")?;
+            Some(J2se {
+                java_vm_args: Some(java_vm_args.to_string()),
+                version: version.to_string(),
+            })
+        })
+        .collect();
+
+    if j2ses.is_empty() { None } else { Some(j2ses) }
 }
 
 fn get_node<'a>(root: &'a Node, tag_name: &str) -> Option<Node<'a, 'a>> {
-    root.descendants().find(|n| {
-        if n.has_tag_name(tag_name) {
-            return true;
-        }
-        return false;
-    })
+    root.descendants().find(|n| n.has_tag_name(tag_name))
 }
 
-fn normalize_url(u: &str) -> Result<(String, String), Error> {
+fn normalize_url(u: &str) -> Result<String, Error> {
     let parsed_url = Url::parse(u)?;
     let mut reconstructed_url = String::with_capacity(u.len());
     reconstructed_url.push_str(parsed_url.scheme());
     reconstructed_url.push_str("://");
     let host = parsed_url.host_str().map_or("", |h| h);
     reconstructed_url.push_str(host);
-    let port = parsed_url
-        .port()
-        .map_or("".to_string(), |p| format!(":{}", p));
-    reconstructed_url.push_str(&port);
+    if let Some(port) = parsed_url.port() {
+        reconstructed_url.push_str(&format!(":{}", port));
+    }
     reconstructed_url.push('/');
-    let path_parts = parsed_url.path().split_terminator("/");
-    for pp in path_parts {
+    for pp in parsed_url.path().split_terminator("/") {
         if !pp.is_empty() {
             reconstructed_url.push_str(pp);
             reconstructed_url.push('/');
         }
     }
-
-    reconstructed_url.pop(); // remove the trailing /
-    let host = format!("{}{}", host, port).replace(":", "_");
-    Ok((reconstructed_url, host))
+    reconstructed_url.pop(); // remove trailing /
+    Ok(reconstructed_url)
 }
 
 fn sha256_of_file(path: &Path) -> Option<String> {
@@ -727,18 +575,21 @@ fn sha256_of_file(path: &Path) -> Option<String> {
             Err(_) => return None,
         }
     }
-    Some(openssl::base64::encode_block(hasher.finalize().as_slice()))
+    Some(BASE64.encode(hasher.finalize()))
 }
 
-
 fn has_file_changed(jar_file_path: &Path, hash_in_jnlp: Option<&str>) -> Result<bool, Error> {
+    if !jar_file_path.exists() {
+        return Ok(true);
+    }
     if let Some(hash_in_jnlp) = hash_in_jnlp {
         if let Some(current_hash) = sha256_of_file(jar_file_path) {
             return Ok(hash_in_jnlp != &current_hash);
         }
     }
-    Ok(true)
+    Ok(false)
 }
+
 #[cfg(test)]
 mod tests {
     use crate::webstart::normalize_url;
@@ -757,7 +608,7 @@ mod tests {
         ];
 
         for (src, expected) in candidates {
-            let (reconstructed_url, _host) = normalize_url(src)?;
+            let reconstructed_url = normalize_url(src)?;
             assert_eq!(expected, &reconstructed_url);
         }
         Ok(())

@@ -10,16 +10,15 @@ use std::path::PathBuf;
 use std::process::exit;
 use std::sync::Arc;
 
+use log::{info, warn};
 use serde_json::Number;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 
 use crate::connection::{ConnectionEntry, ConnectionStore};
-use crate::webstart::{WebstartCache, WebstartFile};
+use crate::webstart::{LoadConfig, WebstartCache, WebstartFile};
 
 mod connection;
-mod errors;
-mod verify;
 mod webstart;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -31,7 +30,7 @@ async fn get_launcher_info() -> String {
         "launcher_version".to_string(),
         serde_json::Value::String(String::from(APP_VERSION)),
     );
-    return serde_json::to_string(&obj).unwrap_or_default();
+    serde_json::to_string(&obj).unwrap_or_default()
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -40,12 +39,11 @@ async fn launch(id: String, on_progress: Channel<serde_json::Value>, app: AppHan
         .ok_or_else(|| format!("connection not found: {}", id))?;
     let cache_dir = cs.cache_dir.clone();
     let logs_dir = cs.logs_dir.clone();
-    let cert_store = cs.get_cert_store();
     let address = ce.address.clone();
     let conn_id = ce.id.clone();
     let conn_name = ce.name.clone();
     let donotcache = ce.donotcache;
-    let verify = ce.verify;
+    let engine_type = ce.engine_type.clone();
 
     let mut ws = wc.get(&address);
     if ws.is_none() {
@@ -54,13 +52,22 @@ async fn launch(id: String, on_progress: Channel<serde_json::Value>, app: AppHan
             let address = address.clone();
             let cache_dir = cache_dir.clone();
             let logs_dir = logs_dir.clone();
-            move || WebstartFile::load(&address, &cache_dir, donotcache, &conn_id, &conn_name, &logs_dir, &on_progress)
+            move || WebstartFile::load(LoadConfig {
+                base_url: &address,
+                cache_dir: &cache_dir,
+                donotcache,
+                conn_id: &conn_id,
+                conn_name: &conn_name,
+                engine_type: &engine_type,
+                logs_dir: &logs_dir,
+                on_progress: &on_progress,
+            })
         }).await.map_err(|e| e.to_string())?;
 
         match tmp {
             Err(e) => {
                 let msg = e.to_string();
-                println!("{}", msg);
+                warn!("{}", msg);
                 return Ok(create_json_resp(-1, &msg));
             }
             Ok(wf) => {
@@ -71,16 +78,6 @@ async fn launch(id: String, on_progress: Channel<serde_json::Value>, app: AppHan
         }
     }
     let ws = ws.expect("WebstartFile should be loaded at this point");
-    if verify {
-        let _ = on_progress.send(serde_json::json!({"message": "Verifying jar signatures..."}));
-        let trusted_certs = cs.get_trusted_certs();
-        let verification_status = ws.verify(cert_store.as_ref(), &trusted_certs);
-        if let Err(e) = verification_status {
-            let resp = e.to_json();
-            println!("{}", resp);
-            return Ok(resp);
-        }
-    }
     let _ = on_progress.send(serde_json::json!({"message": "Launching administrator..."}));
     let console_jar = if ce.show_console {
         Some(app.path().resource_dir()
@@ -93,7 +90,7 @@ async fn launch(id: String, on_progress: Channel<serde_json::Value>, app: AppHan
     let r = ws.run(ce, console_jar);
     if let Err(e) = r {
         let msg = e.to_string();
-        println!("{}", msg);
+        warn!("{}", msg);
         return Ok(create_json_resp(-1, &msg));
     }
 
@@ -111,6 +108,12 @@ fn get_default_connectionentry(_cs: State<ConnectionStore>) -> Result<serde_json
 fn get_all_groups(cs: State<ConnectionStore>) -> Result<serde_json::Value, String> {
     let groups = cs.get_all_groups().map_err(|e| e.to_string())?;
     Ok(serde_json::json!(groups))
+}
+
+#[tauri::command]
+fn get_all_engine_types(cs: State<ConnectionStore>) -> Result<serde_json::Value, String> {
+    let engine_types = cs.get_all_engine_types().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!(engine_types))
 }
 
 #[tauri::command]
@@ -143,23 +146,17 @@ fn import(file_path: &str, overwrite: bool, cs: State<ConnectionStore>) -> Resul
     cs.import(file_path, overwrite).map_err(|e| e.to_string())
 }
 
-#[tauri::command(rename_all = "snake_case")]
-fn trust_cert(cert: &str, cs: State<ConnectionStore>) -> Result<String, String> {
-    cs.add_trusted_cert(cert).map_err(|e| e.to_string())?;
-    Ok(String::from("success"))
-}
-
 fn main() {
     let env_fix = fix_path_env::fix_vars(&["JAVA_HOME", "PATH"]);
     if let Err(_e) = env_fix {
-        println!("failed to read JAVA_HOME and PATH environment variables");
+        eprintln!("failed to read JAVA_HOME and PATH environment variables");
     }
 
     let home_directory = home::home_dir().expect("unable to find the path to home directory");
     let launcher_directory = home_directory.join(".launcher");
     if let Err(e) = fs::create_dir(&launcher_directory) {
         if e.kind() != std::io::ErrorKind::AlreadyExists {
-            println!("failed to create .launcher directory: {}", e);
+            eprintln!("failed to create .launcher directory: {}", e);
             exit(1);
         }
     }
@@ -168,16 +165,13 @@ fn main() {
     let legacy_ballista_dir = home_directory.join(".ballista");
     if legacy_ballista_dir.exists() {
         move_file(legacy_ballista_dir.join("ballista-data.json"), launcher_directory.join("launcher-data.json"));
-        move_file(legacy_ballista_dir.join("ballista-trusted-certs.json"), launcher_directory.join("launcher-trusted-certs.json"));
     } else {
-        // Pre-ballista: loose files in home dir with catapult naming
         move_file(home_directory.join("catapult-data.json"), launcher_directory.join("launcher-data.json"));
-        move_file(home_directory.join("catapult-trusted-certs.json"), launcher_directory.join("launcher-trusted-certs.json"));
     }
 
     let connection_store = ConnectionStore::init(launcher_directory);
     if let Err(e) = connection_store {
-        println!("failed to initialize ConnectionStore: {}", e.to_string());
+        eprintln!("failed to initialize ConnectionStore: {}", e);
         exit(1);
     }
 
@@ -201,9 +195,9 @@ fn main() {
             save,
             get_default_connectionentry,
             get_all_groups,
+            get_all_engine_types,
             load_connections,
             load_single_connection,
-            trust_cert,
             get_launcher_info
         ])
         .run(tauri::generate_context!())
@@ -225,13 +219,10 @@ fn create_json_resp(code: i32, msg: &str) -> String {
 
 fn move_file(old: PathBuf, new: PathBuf) {
     if old.exists() && !new.exists() {
-        let r = fs::rename(&old, &new);
-        if let Err(e) = r {
-            println!(
+        if let Err(e) = fs::rename(&old, &new) {
+            info!(
                 "failed to move the file from {:?} to {:?} : {}",
-                old,
-                new,
-                e.to_string()
+                old, new, e
             );
         }
     }
