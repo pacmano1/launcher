@@ -9,6 +9,7 @@ const connectionId = route.params.id
 const isNewConnection = connectionId === "new-connection"
 
 const groups: string[] = await invoke<string[]>("get_all_groups")
+const engineTypes: string[] = await invoke<string[]>("get_all_engine_types")
 
 const isConnectionEdited = ref<boolean>(false)
 
@@ -82,6 +83,10 @@ const handleDelete = async () => {
           <h2 class="text-xs font-medium text-text-tertiary uppercase tracking-wider">Connection</h2>
           <connection-input type="text" label="Name" placeholder="My Server" v-model="server.name" />
           <connection-input type="text" label="Address" placeholder="https://hostname:8443" v-model="server.address" />
+          <div class="space-y-1">
+            <label class="block text-sm font-medium text-text-secondary select-none">Engine Type</label>
+            <insertable-dropdown :options="engineTypes" v-model="server.engineType" />
+          </div>
         </section>
 
         <!-- Right column: Java -->
@@ -123,10 +128,6 @@ const handleDelete = async () => {
             <label class="flex items-center gap-2 text-sm text-text-primary hover:cursor-pointer select-none">
               <input type="checkbox" class="accent-accent" v-model="server.donotcache" />
               Do not cache
-            </label>
-            <label class="flex items-center gap-2 text-sm text-text-primary hover:cursor-pointer select-none">
-              <input type="checkbox" class="accent-accent" v-model="server.verify" />
-              Verify JAR files
             </label>
           </div>
         </section>

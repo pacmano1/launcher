@@ -18,8 +18,6 @@ use crate::connection::{ConnectionEntry, ConnectionStore};
 use crate::webstart::{WebstartCache, WebstartFile};
 
 mod connection;
-mod errors;
-mod verify;
 mod webstart;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -40,12 +38,11 @@ async fn launch(id: String, on_progress: Channel<serde_json::Value>, app: AppHan
         .ok_or_else(|| format!("connection not found: {}", id))?;
     let cache_dir = cs.cache_dir.clone();
     let logs_dir = cs.logs_dir.clone();
-    let cert_store = cs.get_cert_store();
     let address = ce.address.clone();
     let conn_id = ce.id.clone();
     let conn_name = ce.name.clone();
     let donotcache = ce.donotcache;
-    let verify = ce.verify;
+    let engine_type = ce.engine_type.clone();
 
     let mut ws = wc.get(&address);
     if ws.is_none() {
@@ -54,7 +51,7 @@ async fn launch(id: String, on_progress: Channel<serde_json::Value>, app: AppHan
             let address = address.clone();
             let cache_dir = cache_dir.clone();
             let logs_dir = logs_dir.clone();
-            move || WebstartFile::load(&address, &cache_dir, donotcache, &conn_id, &conn_name, &logs_dir, &on_progress)
+            move || WebstartFile::load(&address, &cache_dir, donotcache, &conn_id, &conn_name, &engine_type, &logs_dir, &on_progress)
         }).await.map_err(|e| e.to_string())?;
 
         match tmp {
@@ -71,16 +68,6 @@ async fn launch(id: String, on_progress: Channel<serde_json::Value>, app: AppHan
         }
     }
     let ws = ws.expect("WebstartFile should be loaded at this point");
-    if verify {
-        let _ = on_progress.send(serde_json::json!({"message": "Verifying jar signatures..."}));
-        let trusted_certs = cs.get_trusted_certs();
-        let verification_status = ws.verify(cert_store.as_ref(), &trusted_certs);
-        if let Err(e) = verification_status {
-            let resp = e.to_json();
-            println!("{}", resp);
-            return Ok(resp);
-        }
-    }
     let _ = on_progress.send(serde_json::json!({"message": "Launching administrator..."}));
     let console_jar = if ce.show_console {
         Some(app.path().resource_dir()
@@ -114,6 +101,12 @@ fn get_all_groups(cs: State<ConnectionStore>) -> Result<serde_json::Value, Strin
 }
 
 #[tauri::command]
+fn get_all_engine_types(cs: State<ConnectionStore>) -> Result<serde_json::Value, String> {
+    let engine_types = cs.get_all_engine_types().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!(engine_types))
+}
+
+#[tauri::command]
 fn load_connections(cs: State<ConnectionStore>) -> String {
     cs.to_json_array_string()
 }
@@ -143,11 +136,6 @@ fn import(file_path: &str, overwrite: bool, cs: State<ConnectionStore>) -> Resul
     cs.import(file_path, overwrite).map_err(|e| e.to_string())
 }
 
-#[tauri::command(rename_all = "snake_case")]
-fn trust_cert(cert: &str, cs: State<ConnectionStore>) -> Result<String, String> {
-    cs.add_trusted_cert(cert).map_err(|e| e.to_string())?;
-    Ok(String::from("success"))
-}
 
 fn main() {
     let env_fix = fix_path_env::fix_vars(&["JAVA_HOME", "PATH"]);
@@ -201,9 +189,9 @@ fn main() {
             save,
             get_default_connectionentry,
             get_all_groups,
+            get_all_engine_types,
             load_connections,
             load_single_connection,
-            trust_cert,
             get_launcher_info
         ])
         .run(tauri::generate_context!())

@@ -9,12 +9,9 @@ use std::process::{Command, Stdio};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 use anyhow::Error;
-use openssl::x509::store::X509StoreRef;
-use openssl::x509::X509;
 use reqwest::blocking::{Client, ClientBuilder};
 use reqwest::Url;
 use roxmltree::Node;
@@ -23,14 +20,9 @@ use sha2::{Digest, Sha256};
 use tauri::ipc::Channel;
 
 use crate::connection::ConnectionEntry;
-use crate::errors::VerificationError;
-use crate::verify::verify_jar;
 
 /// How long a cached WebstartFile remains valid before re-fetching (seconds)
 const WEBSTART_CACHE_TTL_SECS: u64 = 120;
-
-/// Maximum concurrent download threads for JAR retrieval
-const DOWNLOAD_THREADS: usize = 4;
 
 /// Windows: CREATE_NO_WINDOW flag to suppress console window
 #[cfg(windows)]
@@ -47,12 +39,6 @@ pub struct WebstartFile {
     logs_dir: PathBuf,
     conn_id: String,
     loaded_at: SystemTime,
-}
-
-#[derive(Debug)]
-struct VendorInfo {
-    vendor: String,
-    version: String,
 }
 
 /// from jnlp -> resources -> j2se
@@ -94,14 +80,11 @@ impl WebstartCache {
 }
 
 impl WebstartFile {
-    pub fn load(base_url: &str, cache_dir: &PathBuf, donotcache: bool, conn_id: &str, conn_name: &str, logs_dir: &PathBuf, on_progress: &Channel<serde_json::Value>) -> Result<WebstartFile, Error> {
+    pub fn load(base_url: &str, cache_dir: &PathBuf, donotcache: bool, conn_id: &str, conn_name: &str, engine_type: &str, logs_dir: &PathBuf, on_progress: &Channel<serde_json::Value>) -> Result<WebstartFile, Error> {
         let (base_url, _host) = normalize_url(base_url)?;
         let webstart = format!("{}/webstart.jnlp", base_url); // base_url will never contain a / at the end after normalization
         let _ = on_progress.send(serde_json::json!({"message": "Fetching server configuration..."}));
         let cb = ClientBuilder::default()
-            // in certain network environments client is failing with error message "connection closed before message completed"
-            // disabling the pooling resolved the issue
-            .pool_max_idle_per_host(0)
             // accept any cert presented by the MC server
             .danger_accept_invalid_certs(true);
         let client = cb.build()?;
@@ -130,7 +113,7 @@ impl WebstartFile {
             }
         }
 
-        // Build jar_dir based on donotcache flag and vendor detection
+        // Build jar_dir based on donotcache flag and engine type
         let jar_dir = if donotcache {
             // Isolated directory — wiped each launch, never touches shared cache
             let dir = cache_dir.join("_isolated").join(conn_id);
@@ -140,18 +123,9 @@ impl WebstartFile {
             }
             dir
         } else {
-            // Try to detect vendor and version from /api endpoint
-            let _ = on_progress.send(serde_json::json!({"message": "Detecting server version..."}));
-            match fetch_vendor_info(&client, &base_url) {
-                Some(info) => {
-                    println!("detected vendor: {} version: {}", info.vendor, info.version);
-                    cache_dir.join(&info.vendor).join(&info.version)
-                }
-                None => {
-                    println!("could not detect vendor info, using fallback cache path");
-                    cache_dir.join("_unknown").join(&jnlp_version)
-                }
-            }
+            let vendor = sanitize_for_path(engine_type);
+            println!("using engine type for cache: {} (sanitized: {})", engine_type, vendor);
+            cache_dir.join(&vendor).join(&jnlp_version)
         };
 
         if !jar_dir.exists() {
@@ -197,34 +171,51 @@ impl WebstartFile {
     }
 
     pub fn run(&self, ce: Arc<ConnectionEntry>, console_jar: Option<PathBuf>) -> Result<(), Error> {
-        let itr = self.jar_dir.read_dir()?;
         let mut mirth_jars = Vec::new();
         let mut other_jars = Vec::new();
-        for e in itr {
-            let e = e?;
-            if e.metadata()?.is_dir() {
-                continue;
-            }
-            let file_path = e.path();
-            if file_path.extension().and_then(|e| e.to_str()) != Some("jar") {
-                continue;
-            }
-            let file_name = match file_path.file_name().and_then(|f| f.to_str()) {
-                Some(name) => name.to_string(),
-                None => continue,
-            };
-            let file_path_str = match file_path.to_str() {
-                Some(p) => p.to_string(),
-                None => continue,
-            };
 
-            // MirthConnect's own jars contain some overridden classes
-            // of the dependent libraries and hence must be loaded first
-            // https://forums.mirthproject.io/forum/mirth-connect/support/15524-using-com-mirth-connect-client-core-client
-            if file_name.starts_with("mirth") {
-                mirth_jars.push(file_path_str);
-            } else {
-                other_jars.push(file_path_str);
+        // Collect JARs from core/ and extensions/*/
+        let mut dirs_to_scan = vec![self.jar_dir.join("core")];
+        let ext_dir = self.jar_dir.join("extensions");
+        if ext_dir.exists() {
+            for entry in ext_dir.read_dir()? {
+                let entry = entry?;
+                if entry.metadata()?.is_dir() {
+                    dirs_to_scan.push(entry.path());
+                }
+            }
+        }
+
+        for dir in &dirs_to_scan {
+            if !dir.exists() {
+                continue;
+            }
+            for e in dir.read_dir()? {
+                let e = e?;
+                if e.metadata()?.is_dir() {
+                    continue;
+                }
+                let file_path = e.path();
+                if file_path.extension().and_then(|e| e.to_str()) != Some("jar") {
+                    continue;
+                }
+                let file_name = match file_path.file_name().and_then(|f| f.to_str()) {
+                    Some(name) => name.to_string(),
+                    None => continue,
+                };
+                let file_path_str = match file_path.to_str() {
+                    Some(p) => p.to_string(),
+                    None => continue,
+                };
+
+                // MirthConnect's own jars contain some overridden classes
+                // of the dependent libraries and hence must be loaded first
+                // https://forums.mirthproject.io/forum/mirth-connect/support/15524-using-com-mirth-connect-client-core-client
+                if file_name.starts_with("mirth") {
+                    mirth_jars.push(file_path_str);
+                } else {
+                    other_jars.push(file_path_str);
+                }
             }
         }
 
@@ -361,94 +352,6 @@ impl WebstartFile {
         Ok(())
     }
 
-    pub fn verify(&self, cert_store: &X509StoreRef, trusted_certs: &[X509]) -> Result<(), VerificationError> {
-        let mut jar_files = Vec::with_capacity(128);
-        let itr = self
-            .jar_dir
-            .read_dir()
-            .map_err(|e| VerificationError {
-                cert: None,
-                msg: format!("failed to read jar files directory: {}", e),
-            })?;
-        for e in itr {
-            let e = e.map_err(|e| VerificationError {
-                cert: None,
-                msg: format!("failed to list directory entry: {}", e),
-            })?;
-            let file_path = e.path();
-            if file_path.extension().and_then(|e| e.to_str()) == Some("jar") {
-                jar_files.push(file_path);
-            }
-        }
-
-        jar_files.sort_unstable();
-        println!("{:?}", jar_files);
-
-        let mut verified_count = 0usize;
-        let mut skipped_count = 0usize;
-        for jf in &jar_files {
-            let file_path = jf.to_str().ok_or_else(|| VerificationError {
-                cert: None,
-                msg: format!("jar file path is not valid UTF-8: {:?}", jf),
-            })?;
-            // Read the JAR into memory once — used for both hashing and verification
-            let jar_data = std::fs::read(jf).map_err(|e| VerificationError {
-                cert: None,
-                msg: format!("failed to read jar file {:?}: {}", jf, e),
-            })?;
-            let mut hasher = Sha256::new();
-            hasher.update(&jar_data);
-            let hash = openssl::base64::encode_block(hasher.finalize().as_slice());
-
-            let sidecar = jf.with_extension("jar.verified");
-            if let Ok(stored) = std::fs::read_to_string(&sidecar) {
-                if stored.trim() == hash {
-                    skipped_count += 1;
-                    println!("skipping verification of {} (already verified)", file_path);
-                    continue;
-                }
-            }
-
-            verify_jar(file_path, &jar_data, cert_store, trusted_certs)?;
-            let _ = std::fs::write(&sidecar, &hash);
-            verified_count += 1;
-        }
-        println!("verification complete: {} verified, {} skipped (unchanged)", verified_count, skipped_count);
-        Ok(())
-    }
-}
-
-/// Fetch vendor name and version from the server's OpenAPI spec at /api.
-/// Returns None if the endpoint is unreachable or returns unexpected format.
-fn fetch_vendor_info(client: &Client, base_url: &str) -> Option<VendorInfo> {
-    let api_url = format!("{}/api", base_url);
-    let resp = client
-        .get(&api_url)
-        .header("Accept", "application/json")
-        .header("X-Requested-With", "XMLHttpRequest")
-        .send()
-        .ok()?;
-
-    if !resp.status().is_success() {
-        println!("vendor info: /api returned status {}", resp.status());
-        return None;
-    }
-
-    let text = resp.text().ok()?;
-    let body: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let info = body.get("info")?;
-    let title = info.get("title")?.as_str()?;
-    let version = info.get("version")?.as_str()?;
-
-    let vendor = sanitize_for_path(title);
-    let version = sanitize_for_path(version);
-
-    if vendor.is_empty() || version.is_empty() {
-        println!("vendor info: empty vendor or version after sanitization");
-        return None;
-    }
-
-    Some(VendorInfo { vendor, version })
 }
 
 /// Sanitize a string for use as a filesystem path component.
@@ -476,7 +379,6 @@ fn sanitize_for_path(s: &str) -> String {
 struct JarTask {
     url: String,
     file_path: PathBuf,
-    file_name: String,
     hash: Option<String>,
 }
 
@@ -492,11 +394,11 @@ fn download_jars(
     collect_jar_tasks(resources_node, client, dir_path, base_url, &mut tasks, on_progress)?;
 
     // Phase 2: check cache and build download list
+    let _ = on_progress.send(serde_json::json!({
+        "message": format!("Checking {} cached files...", tasks.len()),
+    }));
     let mut to_download = Vec::new();
     for task in &tasks {
-        let _ = on_progress.send(serde_json::json!({
-            "message": format!("Verifying cache file {}", task.file_name),
-        }));
         if has_file_changed(&task.file_path, task.hash.as_deref())? {
             to_download.push(task);
         }
@@ -507,54 +409,13 @@ fn download_jars(
     }
 
     let total = to_download.len();
-    let _ = on_progress.send(serde_json::json!({
-        "message": format!("Downloading {} JARs...", total),
-    }));
-
-    // Phase 3: download in parallel
-    let completed = AtomicUsize::new(0);
-    let first_error: Mutex<Option<Error>> = Mutex::new(None);
-
-    std::thread::scope(|s| {
-        let num_threads = to_download.len().min(DOWNLOAD_THREADS);
-        let chunk_size = (to_download.len() + num_threads - 1) / num_threads;
-        for chunk in to_download.chunks(chunk_size) {
-            let client = client;
-            let completed = &completed;
-            let first_error = &first_error;
-            let on_progress = on_progress;
-            s.spawn(move || {
-                for task in chunk {
-                    // Stop if another thread hit an error
-                    if first_error.lock().expect("error lock poisoned").is_some() {
-                        return;
-                    }
-                    let result = (|| -> Result<(), Error> {
-                        let mut resp = client.get(&task.url).send()?;
-                        let mut f = File::create(&task.file_path)?;
-                        resp.copy_to(&mut f)?;
-                        let _ = std::fs::remove_file(task.file_path.with_extension("jar.verified"));
-                        let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                        let _ = on_progress.send(serde_json::json!({
-                            "message": format!("Downloaded {} ({}/{})", task.file_name, done, total),
-                        }));
-                        Ok(())
-                    })();
-                    if let Err(e) = result {
-                        let mut err = first_error.lock().expect("error lock poisoned");
-                        if err.is_none() {
-                            *err = Some(e);
-                        }
-                        return;
-                    }
-                }
-            });
-        }
-    });
-
-    let err = first_error.into_inner().expect("error lock poisoned");
-    if let Some(e) = err {
-        return Err(e);
+    for (i, task) in to_download.iter().enumerate() {
+        let mut resp = client.get(&task.url).send()?;
+        let mut f = File::create(&task.file_path)?;
+        resp.copy_to(&mut f)?;
+        let _ = on_progress.send(serde_json::json!({
+            "message": format!("Downloaded ({}/{})", i + 1, total),
+        }));
     }
 
     Ok(())
@@ -564,6 +425,66 @@ fn collect_jar_tasks(
     resources_node: &Node,
     client: &Client,
     dir_path: &Path,
+    base_url: &str,
+    tasks: &mut Vec<JarTask>,
+    on_progress: &Channel<serde_json::Value>,
+) -> Result<(), Error> {
+    let core_dir = dir_path.join("core");
+    if !core_dir.exists() {
+        std::fs::create_dir_all(&core_dir)?;
+    }
+
+    for n in resources_node.children() {
+        let jar = n.has_tag_name("jar");
+        let extension = n.has_tag_name("extension");
+
+        if !jar && !extension {
+            continue;
+        }
+
+        let href = match n.attribute("href") {
+            Some(h) => h,
+            None => continue,
+        };
+        let url = format!("{}/{}", base_url, href);
+
+        if jar {
+            let file_name = get_file_name_from_path(href);
+            let file_path = core_dir.join(file_name);
+            let hash = n.attribute("sha256").map(|s| s.to_string());
+            tasks.push(JarTask { url, file_path, hash });
+        } else if extension {
+            let ext_name = get_file_name_from_path(href);
+            // Strip .jnlp extension for directory name
+            let ext_dir_name = ext_name.strip_suffix(".jnlp").unwrap_or(ext_name);
+            let ext_dir = dir_path.join("extensions").join(ext_dir_name);
+            if !ext_dir.exists() {
+                std::fs::create_dir_all(&ext_dir)?;
+            }
+
+            // Always fetch extension JNLPs to detect changes
+            let _ = on_progress.send(serde_json::json!({
+                "message": format!("Fetching extension {}...", ext_dir_name),
+            }));
+            let r = client.get(url).send()?;
+            let data = r.text()?;
+
+            let doc = roxmltree::Document::parse(&data)?;
+            let root = doc.root();
+            let resources_node = get_node(&root, "resources");
+            let ext_base_url = format!("{}/webstart/extensions", base_url);
+            if let Some(resources_node) = resources_node {
+                collect_extension_jar_tasks(&resources_node, client, &ext_dir, &ext_base_url, tasks, on_progress)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_extension_jar_tasks(
+    resources_node: &Node,
+    client: &Client,
+    ext_dir: &Path,
     base_url: &str,
     tasks: &mut Vec<JarTask>,
     on_progress: &Channel<serde_json::Value>,
@@ -583,33 +504,24 @@ fn collect_jar_tasks(
         let url = format!("{}/{}", base_url, href);
 
         if jar {
-            let file_name = get_file_name_from_path(href).to_string();
-            let file_path = dir_path.join(&file_name);
+            let file_name = get_file_name_from_path(href);
+            let file_path = ext_dir.join(file_name);
             let hash = n.attribute("sha256").map(|s| s.to_string());
-            tasks.push(JarTask { url, file_path, file_name, hash });
+            tasks.push(JarTask { url, file_path, hash });
         } else if extension {
+            // Nested extension - fetch its JNLP and recurse
             let ext_name = get_file_name_from_path(href);
-            let ext_cache_path = dir_path.join(ext_name);
-            let data = if ext_cache_path.exists() {
-                let _ = on_progress.send(serde_json::json!({
-                    "message": format!("Loading cached extension {}...", ext_name),
-                }));
-                std::fs::read_to_string(&ext_cache_path)?
-            } else {
-                let _ = on_progress.send(serde_json::json!({
-                    "message": format!("Fetching extension {}...", ext_name),
-                }));
-                let r = client.get(url).send()?;
-                let body = r.text()?;
-                let _ = std::fs::write(&ext_cache_path, &body);
-                body
-            };
+            let _ = on_progress.send(serde_json::json!({
+                "message": format!("Fetching extension {}...", ext_name),
+            }));
+            let r = client.get(url).send()?;
+            let data = r.text()?;
+
             let doc = roxmltree::Document::parse(&data)?;
             let root = doc.root();
             let resources_node = get_node(&root, "resources");
-            let ext_base_url = format!("{}/webstart/extensions", base_url);
             if let Some(resources_node) = resources_node {
-                collect_jar_tasks(&resources_node, client, dir_path, &ext_base_url, tasks, on_progress)?;
+                collect_extension_jar_tasks(&resources_node, client, ext_dir, base_url, tasks, on_progress)?;
             }
         }
     }
@@ -732,12 +644,15 @@ fn sha256_of_file(path: &Path) -> Option<String> {
 
 
 fn has_file_changed(jar_file_path: &Path, hash_in_jnlp: Option<&str>) -> Result<bool, Error> {
+    if !jar_file_path.exists() {
+        return Ok(true);
+    }
     if let Some(hash_in_jnlp) = hash_in_jnlp {
         if let Some(current_hash) = sha256_of_file(jar_file_path) {
             return Ok(hash_in_jnlp != &current_hash);
         }
     }
-    Ok(true)
+    Ok(false)
 }
 #[cfg(test)]
 mod tests {

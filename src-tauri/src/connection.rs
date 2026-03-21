@@ -5,11 +5,7 @@
 use anyhow::Error;
 use home::env::Env;
 use home::env::OS_ENV;
-use openssl::x509::store::{X509Store, X509StoreBuilder};
-use openssl::x509::X509;
-use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::{File, OpenOptions};
@@ -46,6 +42,8 @@ pub struct ConnectionEntry {
     pub last_connected: Option<i64>,
     #[serde(default, rename = "showConsole")]
     pub show_console: bool,
+    #[serde(default = "get_default_engine_type", rename = "engineType")]
+    pub engine_type: String,
 }
 
 pub struct ConnectionStore {
@@ -53,8 +51,6 @@ pub struct ConnectionStore {
     con_location: PathBuf,
     pub cache_dir: PathBuf,
     pub logs_dir: PathBuf,
-    cert_store: Mutex<Arc<X509Store>>,
-    trusted_certs_location: PathBuf,
 }
 
 impl Default for ConnectionEntry {
@@ -76,6 +72,7 @@ impl Default for ConnectionEntry {
             donotcache: get_default_donotcache(),
             last_connected: None,
             show_console: false,
+            engine_type: get_default_engine_type(),
         }
     }
 }
@@ -103,10 +100,6 @@ impl ConnectionStore {
             }
         }
 
-        let trusted_certs_location = data_dir_path.join("launcher-trusted-certs.json");
-        let certs = parse_trusted_certs(&trusted_certs_location);
-        let cert_store = create_cert_store(certs);
-
         let cache_dir = data_dir_path.join("cache");
         if !cache_dir.exists() {
             fs::create_dir(&cache_dir)?;
@@ -120,8 +113,6 @@ impl ConnectionStore {
         Ok(ConnectionStore {
             con_location,
             con_cache: Mutex::new(cache),
-            cert_store: Mutex::new(Arc::new(cert_store)),
-            trusted_certs_location,
             cache_dir,
             logs_dir,
         })
@@ -234,49 +225,6 @@ impl ConnectionStore {
         Ok(result.to_string())
     }
 
-    pub fn add_trusted_cert(&self, cert_der: &str) -> Result<(), Error> {
-        let mut certs = parse_trusted_certs(&self.trusted_certs_location);
-        let mut hasher = Sha256::new();
-        hasher.update(cert_der);
-        let hash = hasher.finalize();
-        let hash = hex::encode(&hash);
-
-        let cert_der = openssl::base64::decode_block(cert_der)?;
-        let cert = X509::from_der(cert_der.as_slice())?;
-        if let None = certs.get(&hash) {
-            certs.insert(hash, cert);
-        }
-
-        let mut der_certs = FxHashMap::default();
-        for (key, c) in &certs {
-            let der = c.to_der()?;
-            let der = openssl::base64::encode_block(der.as_slice());
-            der_certs.insert(key.to_string(), der);
-        }
-        let val = serde_json::to_string_pretty(&der_certs)?;
-        let mut f = OpenOptions::new()
-            .append(false)
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.trusted_certs_location)?;
-        f.write_all(val.as_bytes())?;
-
-        let new_store = create_cert_store(certs);
-        *self.cert_store.lock().expect("cert store lock poisoned") = Arc::new(new_store);
-        Ok(())
-    }
-
-    pub fn get_cert_store(&self) -> Arc<X509Store> {
-        let t = self.cert_store.lock().expect("cert store lock poisoned");
-        t.clone()
-    }
-
-    pub fn get_trusted_certs(&self) -> Vec<X509> {
-        let certs = parse_trusted_certs(&self.trusted_certs_location);
-        certs.into_values().collect()
-    }
-
     fn write_connections_to_disk(&self) -> Result<(), Error> {
         let c = self.con_cache.lock().expect("connection cache lock poisoned");
         let val = serde_json::to_string_pretty(c.deref())?;
@@ -329,6 +277,26 @@ impl ConnectionStore {
         groups.extend(collected_groups);
 
         Ok(groups)
+    }
+
+    pub fn get_all_engine_types(&self) -> Result<HashSet<String>, Error> {
+        let connections = self.con_cache
+            .lock()
+            .expect("connection cache lock poisoned");
+
+        let mut engine_types: HashSet<String> = HashSet::new();
+
+        // Ensure default engine type
+        engine_types.insert(get_default_engine_type());
+
+        let collected: HashSet<String> = connections
+            .values()
+            .map(|ce| ce.engine_type.clone())
+            .collect();
+
+        engine_types.extend(collected);
+
+        Ok(engine_types)
     }
 }
 
@@ -393,87 +361,6 @@ pub fn find_java_home() -> String {
     java_home
 }
 
-fn parse_trusted_certs(trusted_certs_location: &PathBuf) -> FxHashMap<String, X509> {
-    let mut certs = FxHashMap::default();
-    let trusted_certs_location_file = File::open(trusted_certs_location);
-    if let Ok(trusted_certs_location_file) = trusted_certs_location_file {
-        let cert_map: serde_json::Result<FxHashMap<String, String>> =
-            serde_json::from_reader(trusted_certs_location_file);
-        if let Ok(cert_map) = cert_map {
-            for (key, der_data) in cert_map {
-                let der_data = openssl::base64::decode_block(&der_data);
-                if let Ok(der_data) = der_data {
-                    let c = X509::from_der(der_data.as_slice());
-                    if let Ok(c) = c {
-                        certs.insert(key, c);
-                    } else {
-                        println!(
-                            "failed to parse cert from DER data with key {} {:?}",
-                            key,
-                            c.err()
-                        );
-                    }
-                } else {
-                    println!(
-                        "invalid base64 encoded data with key {} {:?}",
-                        key,
-                        der_data.err()
-                    );
-                }
-            }
-        } else {
-            println!(
-                "failed to parse trusted certificates JSON file {:?} {:?}",
-                trusted_certs_location,
-                cert_map.err()
-            );
-        }
-    }
-
-    println!("found {} trusted certificates", certs.len());
-    certs
-}
-
-fn create_cert_store(certs: FxHashMap<String, X509>) -> X509Store {
-    let mut cert_store_builder =
-        X509StoreBuilder::new().expect("unable to create X509 store builder");
-
-    #[cfg(not(windows))]
-    {
-        if !openssl_probe::has_ssl_cert_env_vars() {
-            println!("probing and setting OpenSSL environment variables");
-            // SAFETY: must be called before any OpenSSL operations to set cert paths
-            unsafe { openssl_probe::init_openssl_env_vars(); }
-        }
-        cert_store_builder
-            .set_default_paths()
-            .expect("failed to load system default trusted certs");
-    }
-
-    #[cfg(windows)]
-    {
-        let mut loaded = 0usize;
-        if let Ok(win_store) = schannel::cert_store::CertStore::open_current_user("ROOT") {
-            for win_cert in win_store.certs() {
-                if let Ok(x509) = X509::from_der(win_cert.to_der()) {
-                    if cert_store_builder.add_cert(x509).is_ok() {
-                        loaded += 1;
-                    }
-                }
-            }
-        }
-        println!("loaded {} certificates from Windows certificate store", loaded);
-    }
-
-    for (_, c) in certs {
-        cert_store_builder
-            .add_cert(c)
-            .expect("failed to add a cert to the in-memory store");
-    }
-
-    cert_store_builder.build()
-}
-
 fn get_verify() -> bool {
     true
 }
@@ -488,4 +375,8 @@ fn get_default_notes() -> String {
 
 fn get_default_donotcache() -> bool {
     false
+}
+
+fn get_default_engine_type() -> String {
+    String::from("Open Integration Engine")
 }
