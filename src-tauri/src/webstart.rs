@@ -306,7 +306,9 @@ impl WebstartFile {
                 .arg("-cp")
                 .arg(console_jar.to_str().ok_or_else(|| Error::msg("console jar path is not valid UTF-8"))?)
                 .arg("com.innovarhealthcare.launcher.JavaConsoleDialog")
-                .stdin(Stdio::piped());
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
             #[cfg(windows)]
             console_cmd.creation_flags(CREATE_NO_WINDOW);
             let mut console_proc = console_cmd.spawn()?;
