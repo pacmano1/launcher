@@ -27,9 +27,7 @@ use crate::connection::ConnectionEntry;
 /// How long a cached WebstartFile remains valid before re-fetching (seconds)
 const WEBSTART_CACHE_TTL_SECS: u64 = 120;
 
-/// Windows: suppress console window allocation for child java processes.
-/// Tauri's parent has no console, so without this Windows briefly allocates
-/// one for the child before it exits.
+/// Windows: CREATE_NO_WINDOW flag to suppress console window
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -242,11 +240,10 @@ impl WebstartFile {
         let classpath = mirth_jars.join(classpath_separator);
 
         let java_home = ce.java_home.trim();
-        let java_executable = "java";
         let mut cmd = if java_home.is_empty() {
-            Command::new(java_executable)
+            Command::new("java")
         } else {
-            Command::new(PathBuf::from(java_home).join("bin").join(java_executable))
+            Command::new(PathBuf::from(java_home).join("bin").join("java"))
         };
 
         info!("using java from: {:?}", cmd.get_program().to_str());
@@ -294,73 +291,30 @@ impl WebstartFile {
                 .ok_or(Error::msg("Java console jar path not provided"))?;
 
             let java_bin = if java_home.is_empty() {
-                PathBuf::from(java_executable)
+                PathBuf::from("java")
             } else {
-                PathBuf::from(java_home).join("bin").join(java_executable)
+                PathBuf::from(java_home).join("bin").join("java")
             };
-
-            let console_log_path = self.logs_dir.join(format!("{}-console.err.log", self.conn_id));
 
             let mut console_cmd = Command::new(&java_bin);
             console_cmd
-                .arg("-Djava.awt.headless=false")
                 .arg("-Xmx256m")
                 .arg("-cp")
                 .arg(console_jar.to_str().ok_or_else(|| Error::msg("console jar path is not valid UTF-8"))?)
                 .arg("com.innovarhealthcare.launcher.JavaConsoleDialog")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped());
+                .stdin(Stdio::piped());
             #[cfg(windows)]
             console_cmd.creation_flags(CREATE_NO_WINDOW);
-
-            info!("console diagnostic log: {:?}", console_log_path);
-            info!("console command: {:?}", console_cmd);
             let mut console_proc = console_cmd.spawn()?;
 
-            // Drain console stderr into a log file so we can see Java errors on Windows
-            if let (Some(stderr), Ok(mut log)) = (console_proc.stderr.take(), File::create(&console_log_path)) {
-                std::thread::spawn(move || {
-                    use std::io::{Read, Write};
-                    let mut stderr = stderr;
-                    let mut buf = [0u8; 1024];
-                    loop {
-                        match stderr.read(&mut buf) {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => {
-                                let _ = log.write_all(&buf[..n]);
-                                let _ = log.flush();
-                            }
-                        }
-                    }
-                });
-            }
-
-            cmd.stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+            cmd.stdout(Stdio::piped());
             #[cfg(windows)]
             cmd.creation_flags(CREATE_NO_WINDOW);
             let mut target_proc = cmd.spawn()?;
 
             let target_stdout = target_proc.stdout.take();
-            let target_stderr = target_proc.stderr.take();
             let console_stdin = console_proc.stdin.take();
             if let (Some(stdout), Some(stdin)) = (target_stdout, console_stdin) {
-                // Pipe stderr to console in a separate thread
-                if let Some(stderr) = target_stderr {
-                    std::thread::spawn(move || {
-                        use std::io::Read;
-                        let mut stderr = stderr;
-                        let mut buf = [0u8; 1024];
-                        loop {
-                            match stderr.read(&mut buf) {
-                                Ok(0) | Err(_) => break,
-                                Ok(_) => {}
-                            }
-                        }
-                    });
-                }
-                // Pipe stdout to console stdin
                 std::thread::spawn(move || {
                     use std::io::{Read, Write};
                     let mut stdout = stdout;
