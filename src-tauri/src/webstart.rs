@@ -299,6 +299,8 @@ impl WebstartFile {
                 PathBuf::from(java_home).join("bin").join(java_executable)
             };
 
+            let console_log_path = self.logs_dir.join(format!("{}-console.err.log", self.conn_id));
+
             let mut console_cmd = Command::new(&java_bin);
             console_cmd
                 .arg("-Djava.awt.headless=false")
@@ -308,10 +310,31 @@ impl WebstartFile {
                 .arg("com.innovarhealthcare.launcher.JavaConsoleDialog")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null());
+                .stderr(Stdio::piped());
             #[cfg(windows)]
             console_cmd.creation_flags(CREATE_NO_WINDOW);
+
+            info!("console diagnostic log: {:?}", console_log_path);
+            info!("console command: {:?}", console_cmd);
             let mut console_proc = console_cmd.spawn()?;
+
+            // Drain console stderr into a log file so we can see Java errors on Windows
+            if let (Some(stderr), Ok(mut log)) = (console_proc.stderr.take(), File::create(&console_log_path)) {
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    let mut stderr = stderr;
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match stderr.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                let _ = log.write_all(&buf[..n]);
+                                let _ = log.flush();
+                            }
+                        }
+                    }
+                });
+            }
 
             cmd.stdout(Stdio::piped())
                 .stderr(Stdio::piped());
